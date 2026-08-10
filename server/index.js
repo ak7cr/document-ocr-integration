@@ -14,6 +14,8 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   if (!req.file || req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'Upload one PDF file.' });
+  const extractionMethod = req.body.extractionMethod || 'auto';
+  if (!['auto', 'pdfplumber', 'tesseract'].includes(extractionMethod)) return res.status(400).json({ error: 'Choose PDFPlumber, Tesseract, or automatic fallback.' });
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'order-ocr-'));
   const filePath = path.join(dir, 'source.pdf');
   const attempts = [];
@@ -25,9 +27,11 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
     await fs.writeFile(filePath, req.file.buffer);
     let text = '';
     let data = emptyOrder();
-    const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
-    if (pdf) { text = pdf.text; data = extractByRules(text); attempts.at(-1).confidence = confidence(data); }
-    if (confidence(data) < 0.75) {
+    if (extractionMethod !== 'tesseract') {
+      const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
+      if (pdf) { text = pdf.text; data = extractByRules(text); attempts.at(-1).confidence = confidence(data); }
+    }
+    if (extractionMethod === 'tesseract' || (extractionMethod === 'auto' && confidence(data) < 0.75)) {
       const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
       if (ocr) { text = ocr.text; data = extractByRules(text); attempts.at(-1).confidence = confidence(data); }
     }

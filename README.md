@@ -5,6 +5,8 @@
 
 The page displays each attempted stage, the selected result, confidence, and an editable review form. The OCR fallback is triggered by extraction completeness (< 75% of order number, date, vendor, and total), not merely because PDFPlumber returned text.
 
+Choose **Automatic fallback** to start with PDFPlumber and use Tesseract only when needed, or force **PDFPlumber only** / **Tesseract OCR only** from the upload form to compare their extracted text.
+
 ## Run locally
 
 ```bash
@@ -16,4 +18,3 @@ npm run dev
 ```
 
 Tesseract itself must also be installed and available on `PATH` (`brew install tesseract` on macOS).
-
