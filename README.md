@@ -1,13 +1,6 @@
-# Document extraction
+# Learned document extraction
 
-Fallback chain:
-
-1. **PDFPlumber** gets embedded PDF text and deterministic rules extract fields.
-2. If the result is incomplete, **Tesseract OCR** reads rendered PDF pages and the rules run again.
-3. If still incomplete, **Claude Haiku** returns the validated JSON shape.
-4. **Gemini Pro** is the final extraction fallback.
-
-The page displays each attempted provider, the selected result, confidence, and an editable review form. A fallback is triggered by extraction completeness (< 75% of order number, date, vendor, and total), not simply because a PDF library returned text.
+The service extracts PDF text with PDFPlumber or Tesseract, then uses saved template fingerprints, dynamic regex rules, and dictionary aliases for recurring layouts. For an unfamiliar low-confidence layout, it can optionally ask Claude to extract fields and propose a reusable template. Templates are only saved after review in the UI.
 
 ## Run locally
 
@@ -17,6 +10,18 @@ source .venv/bin/activate
 pip install -r requirements.txt
 npm install
 cp .env.example .env
+psql "$DATABASE_URL" -f db/schema.sql
 npm run dev
 ```
 
+Install the Tesseract executable as well (`brew install tesseract` on macOS).
+
+## Extraction flow
+
+1. Choose PDFPlumber, Tesseract, or automatic text extraction.
+2. Match active templates using stable document anchors.
+3. Apply the matching template’s scoped regex rules and dictionary aliases.
+4. If no template matches, run deterministic rules; low confidence optionally invokes Claude.
+5. Review the result and save the proposed template. Future matching documents use it before AI.
+
+`DATABASE_URL` is optional for one-off extraction. It is required for saved templates, dictionaries, and extraction history. `ANTHROPIC_API_KEY` is optional; without it the app still produces a deterministic template proposal for review.

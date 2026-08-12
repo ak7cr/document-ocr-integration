@@ -6,16 +6,19 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, runLocalExtractor } from './extraction.js';
-import { saveRun } from './database.js';
+import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, matchTemplate, runLocalExtractor } from './extraction.js';
+import { getActiveTemplates, getDictionary, markTemplateMatched, saveRun, saveTemplate } from './database.js';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   if (!req.file || req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'Upload one PDF file.' });
+  const extractionMethod = req.body.extractionMethod || 'auto';
+  if (!['auto', 'pdfplumber', 'tesseract'].includes(extractionMethod)) return res.status(400).json({ error: 'Choose PDFPlumber, Tesseract, or automatic fallback.' });
   const id = crypto.randomUUID();
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'order-ocr-'));
   const filePath = path.join(dir, 'source.pdf');
@@ -27,26 +30,49 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   try {
     await fs.writeFile(filePath, req.file.buffer);
     let text = '';
-    let data = emptyOrder();
-    const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
-    if (pdf) { text = pdf.text; data = extractByRules(text); attempts.at(-1).confidence = confidence(data); }
-    if (confidence(data) < 0.75) {
+    if (extractionMethod !== 'tesseract') {
+      const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
+      if (pdf) text = pdf.text;
+    }
+    if (extractionMethod === 'tesseract' || (extractionMethod === 'auto' && !text.trim())) {
       const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
-      if (ocr) { text = ocr.text; data = extractByRules(text); attempts.at(-1).confidence = confidence(data); }
+      if (ocr) text = ocr.text;
     }
+    const [templates, dictionary] = await Promise.all([getActiveTemplates(), getDictionary()]);
+    const match = matchTemplate(text, templates);
+    let data = emptyOrder();
     let source = attempts.findLast((item) => item.status === 'completed')?.name || 'manual_review';
-    if (confidence(data) < 0.75) {
-      const claude = await tryStep('claude_haiku', () => extractWithClaude(text));
-      if (claude) { data = claude; source = 'claude_haiku'; attempts.at(-1).confidence = confidence(data); }
+    let templateId = null;
+    let proposedTemplate;
+    if (match) {
+      data = applyTemplate(text, match.template, dictionary);
+      source = 'saved_template'; templateId = match.template.id;
+      attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% fingerprint match)` });
+      await markTemplateMatched(templateId);
+    } else {
+      data = extractByRules(text, dictionary);
+      attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
-    if (confidence(data) < 0.75) {
-      const gemini = await tryStep('gemini_pro', () => extractWithGemini(text));
-      if (gemini) { data = gemini; source = 'gemini_pro'; attempts.at(-1).confidence = confidence(data); }
+    if (confidence(data) < 0.75 && process.env.ANTHROPIC_API_KEY) {
+      const ai = await tryStep('ai_template_proposal', () => extractWithClaude(text));
+      if (ai) { data = ai.data; proposedTemplate = ai.template; source = 'ai_proposal'; attempts.at(-1).confidence = confidence(data); }
     }
-    const run = { id, fileName: req.file.originalname, mimeType: req.file.mimetype, data, source, confidence: confidence(data), attempts };
+    proposedTemplate ??= buildTemplateProposal(text, data);
+    const run = { id, fileName: req.file.originalname, mimeType: req.file.mimetype, data, source, templateId, confidence: confidence(data), attempts, text };
     const persisted = await saveRun(run).catch((error) => { attempts.push({ name: 'postgres', status: 'failed', detail: error.message }); return false; });
-    res.status(201).json({ ...run, persisted, preview: text.slice(0, 1200) });
+    res.status(201).json({ ...run, text: undefined, persisted, proposedTemplate, preview: text.slice(0, 1200) });
   } catch (error) { next(error); } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
+
+app.post('/api/templates', async (req, res, next) => {
+  try {
+    const { name, fingerprint, fieldRules, runId } = req.body;
+    if (!name || !Array.isArray(fingerprint?.anchors) || !fingerprint.anchors.length || !fieldRules || typeof fieldRules !== 'object') return res.status(400).json({ error: 'A template name, fingerprint anchors, and field rules are required.' });
+    const id = crypto.randomUUID();
+    await saveTemplate({ id, name, fingerprint, fieldRules, runId });
+    res.status(201).json({ id, name });
+  } catch (error) { next(error); }
+});
+
 app.use((error, _req, res, _next) => res.status(500).json({ error: error.message || 'Extraction failed.' }));
 app.listen(process.env.PORT || 3001, () => console.log(`API listening on http://localhost:${process.env.PORT || 3001}`));
