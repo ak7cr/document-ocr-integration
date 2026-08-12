@@ -6,13 +6,15 @@
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
     "dev:api": "node --watch server/index.js",
     "dev:web": "vite --config client/vite.config.js",
-    "start": "node server/index.js"
+    "start": "node server/index.js",
+    "db:init": "psql \"$DATABASE_URL\" -f db/schema.sql"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.0.2",

@@ -10,7 +10,6 @@ function App() {
   const [file, setFile] = useState();
   const [result, setResult] = useState();
   const [form, setForm] = useState(blank);
-  const [extractionMethod, setExtractionMethod] = useState('auto');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const onChoose = (next) => { setFile(next); setResult(); setForm(blank); setError(''); };
@@ -18,7 +17,7 @@ function App() {
     if (!file) return;
     setLoading(true); setError('');
     try {
-      const body = new FormData(); body.append('file', file); body.append('extractionMethod', extractionMethod);
+      const body = new FormData(); body.append('file', file);
       const response = await fetch('/api/extractions', { method: 'POST', body });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || 'Upload failed.');

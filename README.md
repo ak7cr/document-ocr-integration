@@ -1,11 +1,13 @@
-# Document extraction 
+# Document extraction
 
-1. **PDFPlumber** reads embedded PDF text and deterministic rules extract fields.
-2. When the result is incomplete, **Tesseract OCR** reads rendered PDF pages and the rules run again.
+Fallback chain:
 
-The page displays each attempted stage, the selected result, confidence, and an editable review form. The OCR fallback is triggered by extraction completeness (< 75% of order number, date, vendor, and total), not merely because PDFPlumber returned text.
+1. **PDFPlumber** gets embedded PDF text and deterministic rules extract fields.
+2. If the result is incomplete, **Tesseract OCR** reads rendered PDF pages and the rules run again.
+3. If still incomplete, **Claude Haiku** returns the validated JSON shape.
+4. **Gemini Pro** is the final extraction fallback.
 
-Choose **Automatic fallback** to start with PDFPlumber and use Tesseract only when needed, or force **PDFPlumber only** / **Tesseract OCR only** from the upload form to compare their extracted text.
+The page displays each attempted provider, the selected result, confidence, and an editable review form. A fallback is triggered by extraction completeness (< 75% of order number, date, vendor, and total), not simply because a PDF library returned text.
 
 ## Run locally
 
@@ -14,7 +16,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 npm install
+cp .env.example .env
 npm run dev
 ```
 
-Tesseract itself must also be installed and available on `PATH` (`brew install tesseract` on macOS).

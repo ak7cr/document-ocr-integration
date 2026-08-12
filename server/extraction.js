@@ -49,3 +49,33 @@ export async function runLocalExtractor(mode, filePath) {
   if (!result.ok) throw new Error(result.error);
   return result;
 }
+
+const schemaInstruction = `Return only valid JSON using this exact shape: {"documentType":"purchase_order|sales_order|unknown","documentNumber":"","documentDate":"","vendorName":"","customerName":"","currency":"","subtotalAmount":"","taxAmount":"","totalAmount":"","lineItems":[{"description":"","quantity":"","unitPrice":"","amount":""}]}. Do not invent values; use empty strings or an empty array when unavailable. Amounts must contain digits and a decimal separator only.`;
+
+function parseModelJson(value) {
+  const json = value.match(/\{[\s\S]*\}/)?.[0];
+  if (!json) throw new Error('Model did not return an extraction JSON object.');
+  const parsed = JSON.parse(json);
+  return { ...emptyOrder(), ...parsed, lineItems: Array.isArray(parsed.lineItems) ? parsed.lineItems : [] };
+}
+
+export async function extractWithClaude(text) {
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured.');
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5', max_tokens: 1500, messages: [{ role: 'user', content: `${schemaInstruction}\n\nDOCUMENT TEXT:\n${text.slice(0, 80_000)}` }] }),
+  });
+  if (!response.ok) throw new Error(`Claude request failed (${response.status}): ${await response.text()}`);
+  return parseModelJson((await response.json()).content?.[0]?.text || '');
+}
+
+export async function extractWithGemini(text) {
+  if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured.');
+  const model = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: `${schemaInstruction}\n\nDOCUMENT TEXT:\n${text.slice(0, 80_000)}` }] }], generationConfig: { responseMimeType: 'application/json' } }),
+  });
+  if (!response.ok) throw new Error(`Gemini request failed (${response.status}): ${await response.text()}`);
+  return parseModelJson((await response.json()).candidates?.[0]?.content?.parts?.[0]?.text || '');
+}
