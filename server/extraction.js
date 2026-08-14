@@ -99,11 +99,27 @@ export async function runLocalExtractor(mode, filePath) {
   return result;
 }
 
-const aiInstruction = `Return JSON only with {"data":{"documentType":"","documentNumber":"","documentDate":"","vendorName":"","customerName":"","currency":"","subtotalAmount":"","taxAmount":"","totalAmount":"","lineItems":[]},"template":{"name":"","fingerprint":{"anchors":["stable label"]},"fieldRules":{"fieldName":{"anchor":"label","regex":"capturing regex"}}}}. Never invent values. Regex must have one capture group.`;
+const aiInstruction = `Return JSON only with {"data":{"documentType":"","documentNumber":"","documentDate":"","vendorName":"","customerName":"","currency":"","subtotalAmount":"","taxAmount":"","lineItems":[]},"template":{"name":"","fingerprint":{"anchors":["stable label"]},"fieldRules":{"fieldName":{"anchor":"label","regex":"capturing regex"}}}}. Read the attached PDF visually when supplied and use the recovered text as supporting context. Never invent values. Regex must have one capture group.`;
 function parseAi(value) { const json = value.match(/\{[\s\S]*\}/)?.[0]; if (!json) throw new Error('AI did not return JSON.'); const parsed = JSON.parse(json); return { data: { ...emptyOrder(), ...(parsed.data || {}) }, template: parsed.template }; }
-export async function extractWithClaude(text) {
+function aiPrompt(text) { return `${aiInstruction}\nRECOVERED TEXT:\n${text.slice(0, 80_000)}`; }
+
+export async function extractWithClaude(text, documentBuffer) {
   if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured.');
-  const response = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5', max_tokens: 1800, messages: [{ role: 'user', content: `${aiInstruction}\nDOCUMENT TEXT:\n${text.slice(0, 80_000)}` }] }) });
+  const content = [];
+  if (documentBuffer) content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: documentBuffer.toString('base64') } });
+  content.push({ type: 'text', text: aiPrompt(text) });
+  const response = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5', max_tokens: 1800, messages: [{ role: 'user', content }] }) });
   if (!response.ok) throw new Error(`Claude request failed (${response.status})`);
   return parseAi((await response.json()).content?.[0]?.text || '');
+}
+
+export async function extractWithGemini(text, documentBuffer) {
+  if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured.');
+  const parts = [{ text: aiPrompt(text) }];
+  if (documentBuffer) parts.push({ inlineData: { mimeType: 'application/pdf', data: documentBuffer.toString('base64') } });
+  const model = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY }, body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 1800 } }) });
+  if (!response.ok) throw new Error(`Gemini request failed (${response.status})`);
+  const body = await response.json();
+  return parseAi(body.candidates?.[0]?.content?.parts?.map((part) => part.text || '').join('') || '');
 }

@@ -6,7 +6,7 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, matchTemplate, runLocalExtractor } from './extraction.js';
+import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, runLocalExtractor } from './extraction.js';
 import { getActiveTemplates, getDictionary, markTemplateMatched, saveRun, saveTemplate } from './database.js';
 
 const app = express();
@@ -53,10 +53,18 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       data = extractByRules(text, dictionary);
       attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
-    const shouldUseAi = extractionMethod === 'ai' || (extractionMethod === 'auto' && confidence(data) < 0.75);
+    const shouldUseAi = !match && (extractionMethod === 'ai' || (extractionMethod === 'auto' && confidence(data) < 0.75));
     if (shouldUseAi) {
-      const ai = await tryStep('ai_template_proposal', () => extractWithClaude(text));
-      if (ai) { data = ai.data; proposedTemplate = ai.template; source = 'ai_proposal'; attempts.at(-1).confidence = confidence(data); }
+      for (const provider of [
+        { name: 'anthropic_claude', extract: () => extractWithClaude(text, req.file.buffer) },
+        { name: 'gemini_3_pro', extract: () => extractWithGemini(text, req.file.buffer) },
+      ]) {
+        const ai = await tryStep(provider.name, provider.extract);
+        if (!ai) continue;
+        data = ai.data; proposedTemplate = ai.template; source = provider.name;
+        attempts.at(-1).confidence = confidence(data);
+        break;
+      }
     }
     proposedTemplate ??= buildTemplateProposal(text, data);
     const run = { id, fileName: req.file.originalname, mimeType: req.file.mimetype, data, source, templateId, confidence: confidence(data), attempts, text };
