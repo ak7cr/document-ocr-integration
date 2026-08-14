@@ -18,10 +18,10 @@ Install the Tesseract executable as well (`brew install tesseract` on macOS).
 
 ## Extraction flow
 
-1. Choose PDFPlumber, Tesseract, or automatic text extraction.
+1. Choose PDFPlumber, Tesseract, AI-assisted extraction, or automatic extraction with an AI fallback.
 2. Match active templates using stable document anchors.
 3. Apply the matching template’s scoped regex rules and dictionary aliases.
-4. If no template matches, run deterministic rules; low confidence optionally invokes Claude.
+4. If no template matches, run deterministic rules. Automatic mode invokes Claude only at low confidence; AI-assisted mode always attempts Claude and falls back to the rule/template result if it fails.
 5. Review the result and save the proposed template. Future matching documents use it before AI.
 
 `DATABASE_URL` is optional for one-off extraction. It is required for saved templates, dictionaries, and extraction history. `ANTHROPIC_API_KEY` is optional; without it the app still produces a deterministic template proposal for review.

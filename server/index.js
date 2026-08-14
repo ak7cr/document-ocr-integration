@@ -18,7 +18,7 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   if (!req.file || req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'Upload one PDF file.' });
   const extractionMethod = req.body.extractionMethod || 'auto';
-  if (!['auto', 'pdfplumber', 'tesseract'].includes(extractionMethod)) return res.status(400).json({ error: 'Choose PDFPlumber, Tesseract, or automatic fallback.' });
+  if (!['auto', 'pdfplumber', 'tesseract', 'ai'].includes(extractionMethod)) return res.status(400).json({ error: 'Choose automatic, PDFPlumber, Tesseract, or AI-assisted extraction.' });
   const id = crypto.randomUUID();
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'order-ocr-'));
   const filePath = path.join(dir, 'source.pdf');
@@ -34,7 +34,7 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
       if (pdf) text = pdf.text;
     }
-    if (extractionMethod === 'tesseract' || (extractionMethod === 'auto' && !text.trim())) {
+    if (extractionMethod === 'tesseract' || ((extractionMethod === 'auto' || extractionMethod === 'ai') && !text.trim())) {
       const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
       if (ocr) text = ocr.text;
     }
@@ -53,7 +53,8 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       data = extractByRules(text, dictionary);
       attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
-    if (confidence(data) < 0.75 && process.env.ANTHROPIC_API_KEY) {
+    const shouldUseAi = extractionMethod === 'ai' || (extractionMethod === 'auto' && confidence(data) < 0.75);
+    if (shouldUseAi) {
       const ai = await tryStep('ai_template_proposal', () => extractWithClaude(text));
       if (ai) { data = ai.data; proposedTemplate = ai.template; source = 'ai_proposal'; attempts.at(-1).confidence = confidence(data); }
     }
