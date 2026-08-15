@@ -10,7 +10,7 @@ function getPool() {
 export async function getActiveTemplates() {
   const db = getPool();
   if (!db) return [];
-  const { rows } = await db.query('SELECT id, name, fingerprint, field_rules AS "fieldRules" FROM document_templates WHERE status = $1', ['active']);
+  const { rows } = await db.query('SELECT id, name, fingerprint, field_rules AS "fieldRules", form_mapping AS "formMapping" FROM document_templates WHERE status = $1', ['active']);
   return rows;
 }
 
@@ -32,13 +32,13 @@ export async function saveRun(run) {
   return true;
 }
 
-export async function saveTemplate({ id, name, fingerprint, fieldRules, runId }) {
+export async function saveTemplate({ id, name, fingerprint, fieldRules, formMapping, runId }) {
   const db = getPool();
   if (!db) throw new Error('DATABASE_URL is not configured. Run db/schema.sql and configure Postgres first.');
   await db.query(
-    `INSERT INTO document_templates (id, name, fingerprint, field_rules)
-     VALUES ($1,$2,$3,$4)`,
-    [id, name, JSON.stringify(fingerprint), JSON.stringify(fieldRules)],
+    `INSERT INTO document_templates (id, name, fingerprint, field_rules, form_mapping)
+     VALUES ($1,$2,$3,$4,$5)`,
+    [id, name, JSON.stringify(fingerprint), JSON.stringify(fieldRules), JSON.stringify(formMapping || {})],
   );
   if (runId) await db.query('UPDATE extraction_runs SET template_id = $1 WHERE id = $2', [id, runId]);
 }

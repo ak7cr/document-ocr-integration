@@ -6,7 +6,7 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, runLocalExtractor } from './extraction.js';
+import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, requiredMappingStatus, runLocalExtractor } from './extraction.js';
 import { getActiveTemplates, getDictionary, markTemplateMatched, saveRun, saveTemplate } from './database.js';
 
 const app = express();
@@ -47,7 +47,9 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
     if (match) {
       data = applyTemplate(text, match.template, dictionary);
       source = 'saved_template'; templateId = match.template.id;
-      attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% fingerprint match)` });
+      const mappingStatus = requiredMappingStatus(data, match.template.formMapping);
+      const requiredDetail = mappingStatus.required.length ? `; ${mappingStatus.required.length - mappingStatus.missing.length}/${mappingStatus.required.length} required form fields filled` : '';
+      attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% fingerprint match)${requiredDetail}` });
       await markTemplateMatched(templateId);
     } else {
       data = extractByRules(text, dictionary);
@@ -75,10 +77,11 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
 
 app.post('/api/templates', async (req, res, next) => {
   try {
-    const { name, fingerprint, fieldRules, runId } = req.body;
-    if (!name || !Array.isArray(fingerprint?.anchors) || !fingerprint.anchors.length || !fieldRules || typeof fieldRules !== 'object') return res.status(400).json({ error: 'A template name, fingerprint anchors, and field rules are required.' });
+    const { name, fingerprint, fieldRules, formMapping, runId } = req.body;
+    const mappingIsValid = formMapping && typeof formMapping === 'object' && Object.entries(formMapping).every(([formField, mapping]) => formField && typeof mapping?.sourceField === 'string' && typeof mapping?.required === 'boolean');
+    if (!name || !Array.isArray(fingerprint?.anchors) || !fingerprint.anchors.length || !fieldRules || typeof fieldRules !== 'object' || !mappingIsValid) return res.status(400).json({ error: 'A template name, fingerprint anchors, field rules, and form mapping are required.' });
     const id = crypto.randomUUID();
-    await saveTemplate({ id, name, fingerprint, fieldRules, runId });
+    await saveTemplate({ id, name, fingerprint, fieldRules, formMapping, runId });
     res.status(201).json({ id, name });
   } catch (error) { next(error); }
 });

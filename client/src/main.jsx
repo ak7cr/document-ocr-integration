@@ -4,6 +4,8 @@ import './styles.css';
 
 const labels = { documentType: 'Document type', documentNumber: 'Order number', documentDate: 'Order date', vendorName: 'Vendor / supplier', customerName: 'Customer / buyer', currency: 'Currency', subtotalAmount: 'Subtotal', taxAmount: 'Tax', totalAmount: 'Total' };
 const blank = Object.fromEntries(Object.keys(labels).map((key) => [key, '']));
+const requiredFormFields = new Set(['documentNumber', 'documentDate', 'vendorName', 'totalAmount']);
+const formMapping = Object.fromEntries(Object.keys(labels).map((field) => [field, { sourceField: field, required: requiredFormFields.has(field) }]));
 
 function App() {
   const input = useRef();
@@ -31,7 +33,7 @@ function App() {
     setSaving(true); setError(''); setMessage('');
     try {
       const proposal = result.proposedTemplate;
-      const response = await fetch('/api/templates', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...proposal, name: proposal.name || form.vendorName || 'Reusable document template', runId: result.id }) });
+      const response = await fetch('/api/templates', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...proposal, name: proposal.name || form.vendorName || 'Reusable document template', formMapping, runId: result.id }) });
       const payload = await response.json(); if (!response.ok) throw new Error(payload.error || 'Template could not be saved.');
       setMessage(`Saved “${payload.name}”. Matching documents will use these rules first.`);
     } catch (err) { setError(err.message); } finally { setSaving(false); }

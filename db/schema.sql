@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS document_templates (
   name TEXT NOT NULL,
   fingerprint JSONB NOT NULL,
   field_rules JSONB NOT NULL,
+  form_mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'draft', 'archived')),
   times_matched INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS extraction_runs (
 -- Safe upgrades for databases created by the earlier extraction-only demo.
 ALTER TABLE extraction_runs ADD COLUMN IF NOT EXISTS template_id UUID REFERENCES document_templates(id);
 ALTER TABLE extraction_runs ADD COLUMN IF NOT EXISTS source_text TEXT;
+ALTER TABLE document_templates ADD COLUMN IF NOT EXISTS form_mapping JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS document_templates_status_idx ON document_templates (status);
 CREATE INDEX IF NOT EXISTS extraction_runs_template_idx ON extraction_runs (template_id);
