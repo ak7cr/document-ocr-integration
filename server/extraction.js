@@ -21,7 +21,7 @@ function clean(value) { return normalizeText(value || '').replace(/^[\-\u2013\u2
 function amount(value) { return value ? value.replace(/[^0-9.,-]/g, '').replace(/,/g, '') : ''; }
 function escapeRegex(value) { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-export function extractByRules(text, dictionary = []) {
+export function extractByRules(text) {
   const data = emptyOrder();
   const lines = text.split(/\r?\n/).map(clean).filter(Boolean);
   const match = (patterns) => {
@@ -38,10 +38,6 @@ export function extractByRules(text, dictionary = []) {
   data.subtotalAmount = amount(match([/\b(?:sub\s*total)\b\s*(?:[:#\-\u2013\u2014]\s*)?((?:₹|\$|€|£|INR|USD|EUR|GBP)?\s*[\d,.-]+)/i]));
   data.taxAmount = amount(match([/\b(?:tax|gst|vat)\b\s*(?:amount)?\s*(?:[:#\-\u2013\u2014]\s*)?((?:₹|\$|€|£|INR|USD|EUR|GBP)?\s*[\d,.-]+)/i]));
   data.totalAmount = amount(match([/\b(?:grand\s*)?total\b\s*(?:amount)?\s*(?:[:#\-\u2013\u2014]\s*)?((?:₹|\$|€|£|INR|USD|EUR|GBP)?\s*[\d,.-]+)/i]));
-  for (const entry of dictionary) {
-    const aliases = [entry.canonicalValue, ...(entry.aliases || [])].filter(Boolean);
-    if (entry.fieldName === 'vendorName' && !data.vendorName && aliases.some((alias) => text.toLowerCase().includes(alias.toLowerCase()))) data.vendorName = entry.canonicalValue;
-  }
   if (!data.vendorName && lines.length) data.vendorName = lines.find((line) => !/order|date|invoice|page/i.test(line) && /[A-Za-z]{3}/.test(line)) || '';
   return data;
 }
@@ -55,8 +51,8 @@ function extractRule(text, rule) {
   } catch { return ''; }
 }
 
-export function applyTemplate(text, template, dictionary) {
-  const data = extractByRules(text, dictionary);
+export function applyTemplate(text, template) {
+  const data = extractByRules(text);
   const mappings = Object.entries(template.formMapping || {});
   const fields = mappings.length ? mappings.map(([formField, mapping]) => [formField, template.fieldRules?.[mapping.sourceField]]) : Object.entries(template.fieldRules || {});
   for (const [field, rule] of fields) {

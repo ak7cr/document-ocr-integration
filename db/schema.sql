@@ -10,15 +10,6 @@ CREATE TABLE IF NOT EXISTS document_templates (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS field_dictionary (
-  id UUID PRIMARY KEY,
-  field_name TEXT NOT NULL,
-  canonical_value TEXT NOT NULL,
-  aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (field_name, canonical_value)
-);
-
 CREATE TABLE IF NOT EXISTS extraction_runs (
   id UUID PRIMARY KEY,
   original_filename TEXT NOT NULL,

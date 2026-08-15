@@ -14,12 +14,6 @@ export async function getActiveTemplates() {
   return rows;
 }
 
-export async function getDictionary() {
-  const db = getPool();
-  if (!db) return [];
-  const { rows } = await db.query('SELECT field_name AS "fieldName", canonical_value AS "canonicalValue", aliases FROM field_dictionary');
-  return rows;
-}
 
 export async function saveRun(run) {
   const db = getPool();

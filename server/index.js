@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, requiredMappingStatus, runLocalExtractor } from './extraction.js';
-import { getActiveTemplates, getDictionary, markTemplateMatched, saveRun, saveTemplate } from './database.js';
+import { getActiveTemplates, markTemplateMatched, saveRun, saveTemplate } from './database.js';
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -38,21 +38,21 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
       if (ocr) text = ocr.text;
     }
-    const [templates, dictionary] = await Promise.all([getActiveTemplates(), getDictionary()]);
+    const templates = await getActiveTemplates();
     const match = matchTemplate(text, templates);
     let data = emptyOrder();
     let source = attempts.findLast((item) => item.status === 'completed')?.name || 'manual_review';
     let templateId = null;
     let proposedTemplate;
     if (match) {
-      data = applyTemplate(text, match.template, dictionary);
+      data = applyTemplate(text, match.template);
       source = 'saved_template'; templateId = match.template.id;
       const mappingStatus = requiredMappingStatus(data, match.template.formMapping);
       const requiredDetail = mappingStatus.required.length ? `; ${mappingStatus.required.length - mappingStatus.missing.length}/${mappingStatus.required.length} required form fields filled` : '';
       attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% fingerprint match)${requiredDetail}` });
       await markTemplateMatched(templateId);
     } else {
-      data = extractByRules(text, dictionary);
+      data = extractByRules(text);
       attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
     const shouldUseAi = !match && (extractionMethod === 'ai' || (extractionMethod === 'auto' && confidence(data) < 0.75));
