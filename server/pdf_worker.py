@@ -1,4 +1,5 @@
-"""Extract embedded PDF text; render pages and OCR only when requested."""
+"""Extract embedded PDF text; render pages and OCR only when requested.
+Also supports direct OCR of image files (JPEG, PNG, WebP, TIFF)."""
 import json
 import sys
 
@@ -28,10 +29,22 @@ def ocr_text(path):
     return "\n\n".join(pages), count
 
 
+def image_ocr(path):
+    """Run Tesseract directly on an image file (JPEG, PNG, WebP, TIFF, etc.)."""
+    image = Image.open(path).convert("RGB")
+    text = pytesseract.image_to_string(image)
+    return text, 1
+
+
 if __name__ == "__main__":
     try:
         mode, path = sys.argv[1], sys.argv[2]
-        text, pages = embedded_text(path) if mode == "pdfplumber" else ocr_text(path)
+        if mode == "pdfplumber":
+            text, pages = embedded_text(path)
+        elif mode == "image_ocr":
+            text, pages = image_ocr(path)
+        else:
+            text, pages = ocr_text(path)
         print(json.dumps({"ok": True, "text": text, "pages": pages}))
     except Exception as error:
         print(json.dumps({"ok": False, "error": str(error)}))
