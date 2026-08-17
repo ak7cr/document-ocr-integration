@@ -6,8 +6,11 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, requiredMappingStatus, runLocalExtractor } from './extraction.js';
+import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, requiredMappingStatus, runImageExtractor, runLocalExtractor } from './extraction.js';
 import { getActiveTemplates, markTemplateMatched, saveRun, saveTemplate } from './database.js';
+
+const ACCEPTED_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/tiff']);
+const MIME_TO_EXT = { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/tiff': '.tiff' };
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -16,12 +19,19 @@ app.use(express.json({ limit: '1mb' }));
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
-  if (!req.file || req.file.mimetype !== 'application/pdf') return res.status(400).json({ error: 'Upload one PDF file.' });
+  if (!req.file || !ACCEPTED_MIME_TYPES.has(req.file.mimetype)) {
+    return res.status(400).json({ error: 'Upload one PDF or image file (JPG, PNG, WebP, TIFF).' });
+  }
+  const mimeType = req.file.mimetype;
+  const isPdf = mimeType === 'application/pdf';
   const extractionMethod = req.body.extractionMethod || 'auto';
-  if (!['auto', 'pdfplumber', 'tesseract', 'ai'].includes(extractionMethod)) return res.status(400).json({ error: 'Choose automatic, PDFPlumber, Tesseract, or AI-assisted extraction.' });
+  if (!['auto', 'pdfplumber', 'tesseract', 'ai'].includes(extractionMethod)) {
+    return res.status(400).json({ error: 'Choose automatic, PDFPlumber (PDF only), Tesseract, or AI-assisted extraction.' });
+  }
   const id = crypto.randomUUID();
+  const ext = MIME_TO_EXT[mimeType] || '.bin';
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'order-ocr-'));
-  const filePath = path.join(dir, 'source.pdf');
+  const filePath = path.join(dir, `source${ext}`);
   const attempts = [];
   const tryStep = async (name, action) => {
     try { const value = await action(); attempts.push({ name, status: 'completed' }); return value; }
@@ -30,20 +40,33 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   try {
     await fs.writeFile(filePath, req.file.buffer);
     let text = '';
-    if (extractionMethod !== 'tesseract') {
-      const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
-      if (pdf) text = pdf.text;
+
+    if (isPdf) {
+      // ── PDF pipeline ────────────────────────────────────────────────────────
+      if (extractionMethod !== 'tesseract') {
+        const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
+        if (pdf) text = pdf.text;
+      }
+      if (extractionMethod === 'tesseract' || ((extractionMethod === 'auto' || extractionMethod === 'ai') && !text.trim())) {
+        const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
+        if (ocr) text = ocr.text;
+      }
+    } else {
+      // ── Image pipeline ───────────────────────────────────────────────────────
+      // pdfplumber is not applicable; run Tesseract directly on the image file.
+      if (extractionMethod !== 'ai') {
+        const ocr = await tryStep('tesseract_ocr', () => runImageExtractor(filePath));
+        if (ocr) text = ocr.text;
+      }
     }
-    if (extractionMethod === 'tesseract' || ((extractionMethod === 'auto' || extractionMethod === 'ai') && !text.trim())) {
-      const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
-      if (ocr) text = ocr.text;
-    }
+
     const templates = await getActiveTemplates();
     const match = matchTemplate(text, templates);
     let data = emptyOrder();
     let source = attempts.findLast((item) => item.status === 'completed')?.name || 'manual_review';
     let templateId = null;
     let proposedTemplate;
+
     if (match) {
       data = applyTemplate(text, match.template);
       source = 'saved_template'; templateId = match.template.id;
@@ -55,11 +78,15 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       data = extractByRules(text);
       attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
+
+    // AI fallback: fires when no saved template matched AND confidence is low (auto) or always (ai mode).
+    // For images, the AI providers receive the image bytes directly — they can read it visually,
+    // giving much higher accuracy than Tesseract on complex/handwritten layouts.
     const shouldUseAi = !match && (extractionMethod === 'ai' || (extractionMethod === 'auto' && confidence(data) < 0.75));
     if (shouldUseAi) {
       for (const provider of [
-        { name: 'anthropic_claude', extract: () => extractWithClaude(text, req.file.buffer) },
-        { name: 'gemini_3_pro', extract: () => extractWithGemini(text, req.file.buffer) },
+        { name: 'anthropic_claude', extract: () => extractWithClaude(text, req.file.buffer, mimeType) },
+        { name: 'gemini_3_pro',     extract: () => extractWithGemini(text, req.file.buffer, mimeType) },
       ]) {
         const ai = await tryStep(provider.name, provider.extract);
         if (!ai) continue;
@@ -68,8 +95,9 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
         break;
       }
     }
+
     proposedTemplate ??= buildTemplateProposal(text, data);
-    const run = { id, fileName: req.file.originalname, mimeType: req.file.mimetype, data, source, templateId, confidence: confidence(data), attempts, text };
+    const run = { id, fileName: req.file.originalname, mimeType, data, source, templateId, confidence: confidence(data), attempts, text };
     const persisted = await saveRun(run).catch((error) => { attempts.push({ name: 'postgres', status: 'failed', detail: error.message }); return false; });
     res.status(201).json({ ...run, text: undefined, persisted, proposedTemplate, preview: text.slice(0, 1200) });
   } catch (error) { next(error); } finally { await fs.rm(dir, { recursive: true, force: true }); }
