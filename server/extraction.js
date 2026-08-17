@@ -109,24 +109,41 @@ export async function runLocalExtractor(mode, filePath) {
   return result;
 }
 
+/** Run Tesseract directly on an image file (JPEG, PNG, WebP, TIFF). */
+export async function runImageExtractor(filePath) {
+  return runLocalExtractor('image_ocr', filePath);
+}
+
 const aiInstruction = `Return JSON only with {"data":{"documentType":"","documentNumber":"","documentDate":"","vendorName":"","customerName":"","currency":"","subtotalAmount":"","taxAmount":"","lineItems":[]},"template":{"name":"","fingerprint":{"anchors":["stable label"]},"fieldRules":{"fieldName":{"anchor":"label","regex":"capturing regex"}}}}. Read the attached PDF visually when supplied and use the recovered text as supporting context. Never invent values. Regex must have one capture group.`;
 function parseAi(value) { const json = value.match(/\{[\s\S]*\}/)?.[0]; if (!json) throw new Error('AI did not return JSON.'); const parsed = JSON.parse(json); return { data: { ...emptyOrder(), ...(parsed.data || {}) }, template: parsed.template }; }
 function aiPrompt(text) { return `${aiInstruction}\nRECOVERED TEXT:\n${text.slice(0, 80_000)}`; }
 
-export async function extractWithClaude(text, documentBuffer) {
+export async function extractWithClaude(text, documentBuffer, mimeType = 'application/pdf') {
   if (!process.env.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not configured.');
   const content = [];
-  if (documentBuffer) content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: documentBuffer.toString('base64') } });
+  if (documentBuffer) {
+    const isImage = mimeType.startsWith('image/');
+    if (isImage) {
+      // Send as a native image block — Claude can read it visually
+      content.push({ type: 'image', source: { type: 'base64', media_type: mimeType, data: documentBuffer.toString('base64') } });
+    } else {
+      // PDF document block
+      content.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: documentBuffer.toString('base64') } });
+    }
+  }
   content.push({ type: 'text', text: aiPrompt(text) });
   const response = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5', max_tokens: 1800, messages: [{ role: 'user', content }] }) });
   if (!response.ok) throw new Error(`Claude request failed (${response.status})`);
   return parseAi((await response.json()).content?.[0]?.text || '');
 }
 
-export async function extractWithGemini(text, documentBuffer) {
+export async function extractWithGemini(text, documentBuffer, mimeType = 'application/pdf') {
   if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured.');
   const parts = [{ text: aiPrompt(text) }];
-  if (documentBuffer) parts.push({ inlineData: { mimeType: 'application/pdf', data: documentBuffer.toString('base64') } });
+  if (documentBuffer) {
+    // Gemini accepts both PDFs and images as inlineData — just pass the correct mimeType
+    parts.push({ inlineData: { mimeType, data: documentBuffer.toString('base64') } });
+  }
   const model = process.env.GEMINI_MODEL || 'gemini-3.1-pro-preview';
   const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY }, body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 1800 } }) });
   if (!response.ok) {
