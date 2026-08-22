@@ -5,3 +5,4 @@ client/dist/
 uploads/
 __pycache__/
 *.pyc
+venv
