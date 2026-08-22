@@ -7,7 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, requiredMappingStatus, runImageExtractor, runLocalExtractor } from './extraction.js';
-import { getActiveTemplates, markTemplateMatched, saveRun, saveTemplate } from './database.js';
+import { getActiveTemplates, markTemplateMatched, saveCorrections, saveRun, saveTemplate } from './database.js';
+import { applyDictionary, learnFromData, listDictionary, removeDictionaryEntry } from './dictionary.js';
 
 const ACCEPTED_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/tiff']);
 const MIME_TO_EXT = { 'application/pdf': '.pdf', 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/tiff': '.tiff' };
@@ -96,10 +97,22 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       }
     }
 
+    // ── Dictionary lookup: normalize extracted values against known good values ──
+    const { data: dictData, dictionaryHits } = await applyDictionary(data);
+    data = dictData;
+    if (Object.keys(dictionaryHits).length) {
+      attempts.push({ name: 'dictionary_lookup', status: 'completed', confidence: confidence(data), detail: `Normalized: ${Object.keys(dictionaryHits).join(', ')}` });
+    }
+
+    // ── Auto-learn: when confidence is high enough, feed values to the dictionary ──
+    if (confidence(data) >= 0.75) {
+      learnFromData(data).catch(() => {}); // fire-and-forget; never block the response
+    }
+
     proposedTemplate ??= buildTemplateProposal(text, data);
     const run = { id, fileName: req.file.originalname, mimeType, data, source, templateId, confidence: confidence(data), attempts, text };
     const persisted = await saveRun(run).catch((error) => { attempts.push({ name: 'postgres', status: 'failed', detail: error.message }); return false; });
-    res.status(201).json({ ...run, text: undefined, persisted, proposedTemplate, preview: text.slice(0, 1200) });
+    res.status(201).json({ ...run, text: undefined, persisted, proposedTemplate, dictionaryHits, preview: text.slice(0, 1200) });
   } catch (error) { next(error); } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 
@@ -111,6 +124,42 @@ app.post('/api/templates', async (req, res, next) => {
     const id = crypto.randomUUID();
     await saveTemplate({ id, name, fingerprint, fieldRules, formMapping, runId });
     res.status(201).json({ id, name });
+  } catch (error) { next(error); }
+});
+
+// ── PATCH /api/extractions/:id/corrections ────────────────────────────────────
+// Accepts user-corrected form values, persists them to the run record,
+// and learns every tracked field into the dictionary — regardless of original confidence.
+app.patch('/api/extractions/:id/corrections', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const correctedData = req.body;
+    if (!correctedData || typeof correctedData !== 'object') {
+      return res.status(400).json({ error: 'Provide the corrected field values as a JSON object.' });
+    }
+    const [persisted] = await Promise.all([
+      saveCorrections(id, correctedData),
+      learnFromData(correctedData),
+    ]);
+    res.json({ ok: true, persisted, learned: true });
+  } catch (error) { next(error); }
+});
+
+// ── GET /api/dictionary ───────────────────────────────────────────────────────
+// Browse known dictionary entries; optionally filter by ?field=vendorName
+app.get('/api/dictionary', async (req, res, next) => {
+  try {
+    const entries = await listDictionary(req.query.field || null);
+    res.json({ entries });
+  } catch (error) { next(error); }
+});
+
+// ── DELETE /api/dictionary/:id ────────────────────────────────────────────────
+// Remove a wrong or duplicate entry from the dictionary
+app.delete('/api/dictionary/:id', async (req, res, next) => {
+  try {
+    await removeDictionaryEntry(req.params.id);
+    res.json({ ok: true });
   } catch (error) { next(error); }
 });
 

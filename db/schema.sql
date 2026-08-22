@@ -31,3 +31,23 @@ ALTER TABLE document_templates ADD COLUMN IF NOT EXISTS form_mapping JSONB NOT N
 
 CREATE INDEX IF NOT EXISTS document_templates_status_idx ON document_templates (status);
 CREATE INDEX IF NOT EXISTS extraction_runs_template_idx ON extraction_runs (template_id);
+
+-- Field value dictionary: stores canonical values and their observed aliases per field.
+-- Used to normalize extracted values (fuzzy lookup) and learn from confirmed extractions.
+CREATE TABLE IF NOT EXISTS field_dictionary (
+  id          UUID PRIMARY KEY,
+  field_name  TEXT NOT NULL,                              -- e.g. 'vendorName', 'customerName'
+  canonical   TEXT NOT NULL,                              -- the normalized "correct" value
+  aliases     JSONB NOT NULL DEFAULT '[]'::jsonb,         -- array of raw variant strings seen
+  hit_count   INTEGER NOT NULL DEFAULT 1,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS field_dictionary_field_canonical_idx
+  ON field_dictionary (field_name, lower(canonical));
+CREATE INDEX IF NOT EXISTS field_dictionary_field_idx ON field_dictionary (field_name);
+
+-- Allow corrections to be stored back on an extraction run
+ALTER TABLE extraction_runs ADD COLUMN IF NOT EXISTS corrected_data JSONB;
+ALTER TABLE extraction_runs ADD COLUMN IF NOT EXISTS corrected_at TIMESTAMPTZ;
