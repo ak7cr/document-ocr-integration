@@ -6,8 +6,8 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractWithClaude, extractWithGemini, matchTemplate, requiredMappingStatus, runImageExtractor, runLocalExtractor } from './extraction.js';
-import { getActiveTemplates, markTemplateMatched, saveCorrections, saveRun, saveTemplate } from './database.js';
+import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractTableWithClaude, extractTableWithGemini, extractWithClaude, extractWithGemini, lineItemQuality, matchTemplate, parseLocalTableGrid, requiredMappingStatus, runImageExtractor, runLocalExtractor, runLocalTableExtractor, summarizeLineItems } from './extraction.js';
+import { getActiveTemplates, getRunById, markTemplateMatched, saveCorrections, saveRun, saveTemplate } from './database.js';
 import { applyDictionary, learnFromData, listDictionary, removeDictionaryEntry } from './dictionary.js';
 
 const ACCEPTED_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/tiff']);
@@ -54,7 +54,6 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       }
     } else {
       // ── Image pipeline ───────────────────────────────────────────────────────
-      // pdfplumber is not applicable; run Tesseract directly on the image file.
       if (extractionMethod !== 'ai') {
         const ocr = await tryStep('tesseract_ocr', () => runImageExtractor(filePath));
         if (ocr) text = ocr.text;
@@ -70,19 +69,55 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
 
     if (match) {
       data = applyTemplate(text, match.template);
-      source = 'saved_template'; templateId = match.template.id;
+      source = 'saved_template';
+      templateId = match.template.id;
       const mappingStatus = requiredMappingStatus(data, match.template.formMapping);
       const requiredDetail = mappingStatus.required.length ? `; ${mappingStatus.required.length - mappingStatus.missing.length}/${mappingStatus.required.length} required form fields filled` : '';
-      attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% fingerprint match)${requiredDetail}` });
+      attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% match)${requiredDetail}` });
       await markTemplateMatched(templateId);
     } else {
       data = extractByRules(text);
       attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
 
-    // AI fallback: fires when no saved template matched AND confidence is low (auto) or always (ai mode).
-    // For images, the AI providers receive the image bytes directly — they can read it visually,
-    // giving much higher accuracy than Tesseract on complex/handwritten layouts.
+   
+    const looksTabular = data.lineItems.length > 0 || /\n[^\n]*\t[^\n]*\n/.test(text);
+    const lineItemsWeak = !data.lineItems.length || lineItemQuality(data.lineItems) < 0.6;
+    let localTableStrong = false;
+    if (looksTabular && extractionMethod !== 'tesseract' && lineItemsWeak) {
+      const local = await (async () => {
+        try { const v = await runLocalTableExtractor(filePath); attempts.push({ name: 'table_ocr', status: 'completed' }); return v; }
+        catch (error) { attempts.push({ name: 'table_ocr', status: 'failed', detail: error.message }); return null; }
+      })();
+      if (local && local.text) {
+        const localItems = parseLocalTableGrid(local.text);
+        const localQuality = lineItemQuality(localItems);
+        if (localItems.length && localQuality >= 0.6) {
+          data.lineItems = localItems;
+          localTableStrong = true;
+          attempts.at(-1).confidence = localQuality;
+          attempts.at(-1).detail = `${localItems.length} items read locally (RapidOCR)`;
+          // Fill any totals that were not labelled on the document (derivable
+          // from the parsed table); labelled summary lines keep priority.
+          const computed = summarizeLineItems(data.lineItems);
+          for (const [k, v] of Object.entries(computed)) {
+            if (v && !data[k]) data[k] = v;
+          }
+        } else {
+          
+          attempts.at(-1).status = 'failed';
+          attempts.at(-1).detail = localItems.length
+            ? `quality ${localQuality.toFixed(2)} < 0.6 — using AI table fallback`
+            : 'no usable table structure — using AI table fallback';
+        }
+      } else if (local) {
+        attempts.at(-1).status = 'failed';
+        attempts.at(-1).detail = 'no table text returned — using AI table fallback';
+      }
+    }
+
+    // AI fallback — only for fields OCR could not read (headers), and never to
+    // re-do the table when the local table OCR already succeeded.
     const shouldUseAi = !match && (extractionMethod === 'ai' || (extractionMethod === 'auto' && confidence(data) < 0.75));
     if (shouldUseAi) {
       for (const provider of [
@@ -91,22 +126,40 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       ]) {
         const ai = await tryStep(provider.name, provider.extract);
         if (!ai) continue;
-        data = ai.data; proposedTemplate = ai.template; source = provider.name;
+        data = localTableStrong ? { ...ai.data, lineItems: data.lineItems } : ai.data;
+        proposedTemplate = ai.template; source = provider.name;
         attempts.at(-1).confidence = confidence(data);
         break;
       }
     }
 
-    // ── Dictionary lookup: normalize extracted values against known good values ──
+    // ── Dictionary lookup: normalize extracted values against known canonicals ──
     const { data: dictData, dictionaryHits } = await applyDictionary(data);
     data = dictData;
     if (Object.keys(dictionaryHits).length) {
       attempts.push({ name: 'dictionary_lookup', status: 'completed', confidence: confidence(data), detail: `Normalized: ${Object.keys(dictionaryHits).join(', ')}` });
     }
 
-    // ── Auto-learn: when confidence is high enough, feed values to the dictionary ──
+   
+    const mainAiRan = ['anthropic_claude', 'gemini_3_pro'].includes(source);
+    const needsAiTable = looksTabular && extractionMethod !== 'tesseract' && !mainAiRan && !localTableStrong
+      && (!data.lineItems.length || lineItemQuality(data.lineItems) < 0.6);
+    if (needsAiTable) {
+      for (const provider of [
+        { name: 'ai_table_claude', extract: () => extractTableWithClaude(text, req.file.buffer, mimeType) },
+        { name: 'ai_table_gemini', extract: () => extractTableWithGemini(text, req.file.buffer, mimeType) },
+      ]) {
+        const table = await tryStep(provider.name, provider.extract);
+        if (!table || !table.length) continue;
+        data.lineItems = table;
+        attempts.at(-1).detail = `${table.length} items read from the table (${provider.name})`;
+        break;
+      }
+    }
+
+    // ── Auto-learn: when confidence is high, feed canonicals to dictionary ──
     if (confidence(data) >= 0.75) {
-      learnFromData(data).catch(() => {}); // fire-and-forget; never block the response
+      learnFromData(data).catch(() => {});
     }
 
     proposedTemplate ??= buildTemplateProposal(text, data);
@@ -127,9 +180,7 @@ app.post('/api/templates', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-// ── PATCH /api/extractions/:id/corrections ────────────────────────────────────
-// Accepts user-corrected form values, persists them to the run record,
-// and learns every tracked field into the dictionary — regardless of original confidence.
+
 app.patch('/api/extractions/:id/corrections', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -137,16 +188,38 @@ app.patch('/api/extractions/:id/corrections', async (req, res, next) => {
     if (!correctedData || typeof correctedData !== 'object') {
       return res.status(400).json({ error: 'Provide the corrected field values as a JSON object.' });
     }
+
+    const run = await getRunById(id);
+    let templateSaved = false;
+
+    if (run && run.sourceText) {
+      const proposal = buildTemplateProposal(run.sourceText, correctedData, correctedData.vendorName || run.originalFilename);
+      if (Object.keys(proposal.fieldRules).length > 0) {
+        const formMapping = Object.fromEntries(
+          Object.keys(proposal.fieldRules).map((field) => [field, { sourceField: field, required: true }])
+        );
+        await saveTemplate({
+          id: run.templateId || crypto.randomUUID(),
+          name: proposal.name,
+          fingerprint: proposal.fingerprint,
+          fieldRules: proposal.fieldRules,
+          formMapping,
+          runId: id,
+        });
+        templateSaved = true;
+      }
+    }
+
     const [persisted] = await Promise.all([
       saveCorrections(id, correctedData),
       learnFromData(correctedData),
     ]);
-    res.json({ ok: true, persisted, learned: true });
+
+    res.json({ ok: true, persisted, learned: true, templateSaved });
   } catch (error) { next(error); }
 });
 
 // ── GET /api/dictionary ───────────────────────────────────────────────────────
-// Browse known dictionary entries; optionally filter by ?field=vendorName
 app.get('/api/dictionary', async (req, res, next) => {
   try {
     const entries = await listDictionary(req.query.field || null);
@@ -155,7 +228,6 @@ app.get('/api/dictionary', async (req, res, next) => {
 });
 
 // ── DELETE /api/dictionary/:id ────────────────────────────────────────────────
-// Remove a wrong or duplicate entry from the dictionary
 app.delete('/api/dictionary/:id', async (req, res, next) => {
   try {
     await removeDictionaryEntry(req.params.id);

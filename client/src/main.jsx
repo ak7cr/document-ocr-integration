@@ -1,100 +1,71 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
 const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/tiff']);
-const labels = { documentType: 'Document type', documentNumber: 'Order number', documentDate: 'Order date', vendorName: 'Vendor / supplier', customerName: 'Customer / buyer', currency: 'Currency', subtotalAmount: 'Subtotal', taxAmount: 'Tax', totalAmount: 'Total' };
-const blank = Object.fromEntries(Object.keys(labels).map((key) => [key, '']));
+
+
+const FIELD_SCHEMA = [
+  { key: 'documentType', label: 'Document type', type: 'select', options: ['purchase_order', 'sales_order'] },
+  { key: 'documentNumber', label: 'Order number', type: 'text' },
+  { key: 'documentDate', label: 'Order date', type: 'text' },
+  { key: 'vendorName', label: 'Vendor / supplier', type: 'text' },
+  { key: 'customerName', label: 'Customer / buyer', type: 'text' },
+  { key: 'currency', label: 'Currency', type: 'text' },
+  { key: 'subtotalAmount', label: 'Subtotal', type: 'number' },
+  { key: 'taxAmount', label: 'Tax', type: 'number' },
+  { key: 'totalAmount', label: 'Total', type: 'number' },
+];
+const schemaFor = (key) => FIELD_SCHEMA.find((f) => f.key === key);
+const labelFor = (key) => schemaFor(key)?.label || key;
+const blank = Object.fromEntries(FIELD_SCHEMA.map((f) => [f.key, '']));
 const requiredFormFields = new Set(['documentNumber', 'documentDate', 'vendorName', 'totalAmount']);
-const formMapping = Object.fromEntries(Object.keys(labels).map((field) => [field, { sourceField: field, required: requiredFormFields.has(field) }]));
+const formMapping = Object.fromEntries(FIELD_SCHEMA.map((f) => [f.key, { sourceField: f.key, required: requiredFormFields.has(f.key) }]));
+const DOC_TYPE_LABELS = { purchase_order: 'Purchase order', sales_order: 'Sales order' };
 
-// Fields the dictionary actively tracks (must match server/dictionary.js TRACKED_FIELDS)
-const DICT_TRACKED = new Set(['vendorName', 'customerName', 'currency', 'documentType']);
+// ─── Line items table ────────────────────────────────────────────────────────
 
-// ─── Dictionary Panel ────────────────────────────────────────────────────────
+const LINE_ITEM_COLUMNS = [
+  ['serialNo', '#'],
+  ['itemName', 'Item name'],
+  ['hsnSac', 'HSN/SAC'],
+  ['quantity', 'Qty'],
+  ['unit', 'Unit'],
+  ['rate', 'Rate'],
+  ['discount', 'Discount'],
+  ['taxableValue', 'Taxable'],
+  ['cgstAmount', 'CGST'],
+  ['sgstAmount', 'SGST'],
+  ['igstAmount', 'IGST'],
+  ['tax', 'Tax'],
+  ['amount', 'Amount'],
+  ['grossAmount', 'Gross'],
+];
 
-function DictionaryPanel() {
-  const [open, setOpen] = useState(false);
-  const [entries, setEntries] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [field, setField] = useState('');
-
-  async function load() {
-    setLoading(true);
-    try {
-      const url = field ? `/api/dictionary?field=${encodeURIComponent(field)}` : '/api/dictionary';
-      const res = await fetch(url);
-      const payload = await res.json();
-      setEntries(payload.entries || []);
-    } finally { setLoading(false); }
+function LineItemsTable({ items }) {
+  const rows = Array.isArray(items) ? items.filter((it) => it && (it.itemName || it.quantity || it.amount || it.serialNo)) : [];
+  if (!rows.length) {
+    return <p className="text-sm text-slate-400 italic">No line-items table detected in this document.</p>;
   }
-
-  async function remove(id) {
-    await fetch(`/api/dictionary/${id}`, { method: 'DELETE' });
-    setEntries((prev) => prev.filter((e) => e.id !== id));
-  }
-
-  useEffect(() => { if (open) load(); }, [open, field]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Group entries by fieldName for display
-  const grouped = entries.reduce((acc, e) => { (acc[e.fieldName] ??= []).push(e); return acc; }, {});
-
+  const cols = LINE_ITEM_COLUMNS.filter(([key]) => rows.some((it) => it[key]));
   return (
-    <div className="mt-6 rounded-xl border border-slate-700 bg-slate-900/60">
-      <button
-        id="dict-panel-toggle"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-4 py-3 text-sm font-semibold text-slate-300 hover:text-white transition"
-      >
-        <span> Field Dictionary {entries.length > 0 && !open ? `(${entries.length} entries)` : ''}</span>
-        <span className="text-slate-500">{open ? '▲' : '▼'}</span>
-      </button>
-
-      {open && (
-        <div className="border-t border-slate-700 px-4 pb-4 pt-3">
-          <div className="flex flex-wrap gap-2 items-center mb-3">
-            <label className="text-xs text-slate-400 font-medium">Filter by field:</label>
-            <select
-              value={field}
-              onChange={(e) => setField(e.target.value)}
-              className="rounded-lg border border-slate-600 bg-slate-950 px-2 py-1 text-xs text-slate-100 outline-none focus:border-cyan-400"
-            >
-              <option value="">All tracked fields</option>
-              {[...DICT_TRACKED].map((f) => <option key={f} value={f}>{labels[f] || f}</option>)}
-            </select>
-            <button onClick={load} className="ml-auto rounded-lg border border-slate-600 px-3 py-1 text-xs text-slate-300 hover:border-cyan-400 hover:text-cyan-300 transition">
-              {loading ? 'Loading…' : '↻ Refresh'}
-            </button>
-          </div>
-
-          {Object.keys(grouped).length === 0
-            ? <p className="text-xs text-slate-500 italic">No entries yet. Submit a document with high confidence or use "Submit Corrections" to build the dictionary.</p>
-            : Object.entries(grouped).map(([fieldName, items]) => (
-              <div key={fieldName} className="mb-4">
-                <h4 className="text-xs font-semibold text-cyan-400 mb-1">{labels[fieldName] || fieldName}</h4>
-                <div className="space-y-1">
-                  {items.map((entry) => (
-                    <div key={entry.id} className="flex items-start justify-between gap-2 rounded-lg bg-slate-950/60 px-3 py-2 text-xs">
-                      <div className="min-w-0">
-                        <span className="font-medium text-slate-200 break-words">{entry.canonical}</span>
-                        {entry.aliases?.length > 0 && (
-                          <span className="ml-2 text-slate-500">({entry.aliases.join(', ')})</span>
-                        )}
-                        <span className="ml-2 rounded-full bg-slate-800 px-1.5 py-0.5 text-slate-400">×{entry.hitCount}</span>
-                      </div>
-                      <button
-                        onClick={() => remove(entry.id)}
-                        title="Remove this entry"
-                        className="shrink-0 rounded px-1.5 py-0.5 text-rose-400 hover:bg-rose-950 transition text-xs"
-                      >✕</button>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))
-          }
-        </div>
-      )}
+    <div className="overflow-x-auto rounded-lg border border-slate-200">
+      <table className="min-w-full table-auto text-left text-sm">
+        <thead>
+          <tr className="bg-slate-50 text-slate-500">
+            {cols.map(([key, label]) => <th key={label} className="whitespace-nowrap px-3 py-2 font-semibold">{label}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((it, i) => (
+            <tr key={i} className="border-t border-slate-100 align-top odd:bg-white even:bg-slate-50/60">
+              {cols.map(([key]) => (
+                <td key={key} className="whitespace-nowrap px-3 py-2 text-slate-700">{it[key] || '—'}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -117,8 +88,13 @@ function App() {
   const isImage = file && IMAGE_TYPES.has(file.type);
   const onChoose = (next) => { setFile(next); setResult(); setForm(blank); setOriginalForm(blank); setError(''); setMessage(''); };
 
+  // Dynamic field set: schema fields + any extra scalar keys the API returns.
+  const fieldKeys = result
+    ? [...new Set([...FIELD_SCHEMA.map((f) => f.key), ...Object.keys(result.data || {}).filter((k) => k !== 'lineItems' && typeof result.data[k] !== 'object')])]
+    : FIELD_SCHEMA.map((f) => f.key);
+
   // Detect whether the user has changed any field from the extracted values
-  const hasChanges = result && Object.keys(labels).some((key) => form[key] !== originalForm[key]);
+  const hasChanges = result && fieldKeys.some((key) => form[key] !== originalForm[key]);
 
   async function extract() {
     if (!file) return;
@@ -150,7 +126,7 @@ function App() {
       const response = await fetch(`/api/extractions/${result.id}/corrections`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(form),
+        body: JSON.stringify(Object.fromEntries(fieldKeys.map((k) => [k, form[k] || '']))),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || 'Could not save corrections.');
@@ -160,8 +136,8 @@ function App() {
     } catch (err) { setError(err.message); } finally { setSubmitting(false); }
   }
 
-  return <main className="min-h-screen bg-slate-950 text-slate-100"><div className="mx-auto max-w-6xl px-6 py-14">
-    <section className="grid gap-6 lg:grid-cols-[.9fr_1.4fr]">
+  return <main className="min-h-screen bg-slate-950 text-slate-100"><div className="mx-auto max-w-5xl px-6 py-14">
+    <section className="grid gap-6 lg:grid-cols-[340px_minmax(0,1fr)]">
       <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 shadow-2xl shadow-black/20">
         <h2 className="text-lg font-semibold">1. Upload document</h2>
         <button id="upload-area" onClick={() => input.current.click()} className="mt-5 flex min-h-48 w-full flex-col items-center justify-center rounded-xl border border-dashed border-slate-600 bg-slate-950/40 p-6 text-center transition hover:border-cyan-400">
@@ -209,9 +185,6 @@ function App() {
             }
           </ol>
         </div>
-
-        {/* Dictionary Panel (always visible in sidebar) */}
-        <DictionaryPanel />
       </div>
 
       <div className="rounded-2xl border border-slate-800 bg-white p-6 text-slate-900">
@@ -224,38 +197,53 @@ function App() {
         </div>
 
         <div className="mt-6 grid gap-4 sm:grid-cols-2">
-          {Object.entries(labels).map(([key, label]) => {
-            const dictHit = result?.dictionaryHits?.[key];
+          {fieldKeys.map((key) => {
+            const schema = schemaFor(key);
+            const type = schema?.type || 'text';
+            const changed = form[key] !== originalForm[key];
+            const inputClass = `mt-1.5 w-full rounded-lg border px-3 py-2.5 text-slate-900 outline-none focus:ring-2 ${changed
+              ? 'border-amber-400 bg-amber-50 focus:border-amber-500 focus:ring-amber-100'
+              : 'border-slate-200 focus:border-cyan-500 focus:ring-cyan-100'
+            }`;
+            const onChange = (event) => setForm({ ...form, [key]: event.target.value });
             return (
               <label key={key} className="text-sm font-medium text-slate-600">
-                <span className="flex items-center gap-1.5">
-                  {label}
-                  {dictHit && (
-                    <span
-                      title={`Dictionary match: "${dictHit.canonical}" (${Math.round(dictHit.score * 100)}% similarity)`}
-                      className="rounded-full bg-violet-100 px-1.5 py-0.5 text-xs font-semibold text-violet-600 cursor-help"
-                    > dict</span>
-                  )}
-                  {DICT_TRACKED.has(key) && !dictHit && result && (
-                    <span title="This field is tracked by the dictionary" className="text-slate-300 text-xs">◦</span>
-                  )}
-                </span>
-                <input
-                  id={`field-${key}`}
-                  value={form[key] || ''}
-                  onChange={(event) => setForm({ ...form, [key]: event.target.value })}
-                  className={`mt-1.5 w-full rounded-lg border px-3 py-2.5 text-slate-900 outline-none focus:ring-2 ${form[key] !== originalForm[key]
-                      ? 'border-amber-400 bg-amber-50 focus:border-amber-500 focus:ring-amber-100'
-                      : 'border-slate-200 focus:border-cyan-500 focus:ring-cyan-100'
-                    }`}
-                  placeholder="Not extracted"
-                />
+                <span>{labelFor(key)}</span>
+                {type === 'select' ? (
+                  <select id={`field-${key}`} value={form[key] || ''} onChange={onChange} className={inputClass}>
+                    <option value="">Not extracted</option>
+                    {(schema?.options || []).map((opt) => (
+                      <option key={opt} value={opt}>{DOC_TYPE_LABELS[opt] || opt}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    id={`field-${key}`}
+                    type={type}
+                    value={form[key] || ''}
+                    onChange={onChange}
+                    className={inputClass}
+                    placeholder="Not extracted"
+                  />
+                )}
               </label>
             );
           })}
         </div>
 
         {result && <>
+          {/* ── Table contents ── */}
+          <div className="mt-6 border-t border-slate-200 pt-5">
+            <div className="flex items-center gap-2">
+              <h3 className="font-semibold">Table contents</h3>
+              {result.data?.lineItems?.length > 0 && (
+                <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-500">{result.data.lineItems.length} item{result.data.lineItems.length === 1 ? '' : 's'}</span>
+              )}
+            </div>
+            <p className="mb-3 text-sm text-slate-500">Line items extracted from the document table (serial no., item, quantity, rate, discount, tax, amount).</p>
+            <LineItemsTable items={result.data?.lineItems} />
+          </div>
+
           {/* ── Action row ── */}
           <div className="mt-6 flex flex-wrap gap-3">
             {/* Submit Corrections — always shown, disabled only when nothing changed */}
@@ -284,7 +272,7 @@ function App() {
 
           {hasChanges && (
             <p className="mt-2 text-xs text-amber-600">
-              {Object.keys(labels).filter((k) => form[k] !== originalForm[k]).length} field(s) changed — click <strong>Submit Corrections</strong> to teach the dictionary.
+              {fieldKeys.filter((k) => form[k] !== originalForm[k]).length} field(s) changed — click <strong>Submit Corrections</strong> to teach the dictionary.
             </p>
           )}
 

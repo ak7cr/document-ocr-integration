@@ -15,6 +15,16 @@ export async function getActiveTemplates() {
   return rows;
 }
 
+export async function getRunById(id) {
+  const db = getPool();
+  if (!db) return null;
+  const { rows } = await db.query(
+    'SELECT id, original_filename AS "originalFilename", mime_type AS "mimeType", document_type AS "documentType", extraction_source AS "extractionSource", template_id AS "templateId", confidence, extracted_data AS "extractedData", source_text AS "sourceText" FROM extraction_runs WHERE id = $1',
+    [id],
+  );
+  return rows[0] || null;
+}
+
 export async function saveRun(run) {
   const db = getPool();
   if (!db) return false;
@@ -29,12 +39,15 @@ export async function saveRun(run) {
 export async function saveTemplate({ id, name, fingerprint, fieldRules, formMapping, runId }) {
   const db = getPool();
   if (!db) throw new Error('DATABASE_URL is not configured. Run db/schema.sql and configure Postgres first.');
+  const templateId = id || crypto.randomUUID();
   await db.query(
     `INSERT INTO document_templates (id, name, fingerprint, field_rules, form_mapping)
-     VALUES ($1,$2,$3,$4,$5)`,
-    [id, name, JSON.stringify(fingerprint), JSON.stringify(fieldRules), JSON.stringify(formMapping || {})],
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (id) DO UPDATE SET name = $2, fingerprint = $3, field_rules = $4, form_mapping = $5, updated_at = NOW()`,
+    [templateId, name, JSON.stringify(fingerprint), JSON.stringify(fieldRules), JSON.stringify(formMapping || {})],
   );
-  if (runId) await db.query('UPDATE extraction_runs SET template_id = $1 WHERE id = $2', [id, runId]);
+  if (runId) await db.query('UPDATE extraction_runs SET template_id = $1 WHERE id = $2', [templateId, runId]);
+  return templateId;
 }
 
 export async function markTemplateMatched(id) {
@@ -42,11 +55,11 @@ export async function markTemplateMatched(id) {
   if (db && id) await db.query('UPDATE document_templates SET times_matched = times_matched + 1, updated_at = NOW() WHERE id = $1', [id]);
 }
 
-// ─── Dictionary ──────────────────────────────────────────────────────────────
+//  Dictionary
 
-/**
- * Fetch all dictionary entries, optionally filtered by field_name.
- */
+
+// Fetch all dictionary entries, optionally filtered by field_name.
+ 
 export async function getDictionaryEntries(fieldName) {
   const db = getPool();
   if (!db) return [];
@@ -63,15 +76,12 @@ export async function getDictionaryEntries(fieldName) {
   return rows;
 }
 
-/**
- * Upsert a learned value into the dictionary.
- * jaroWinkler and normalize are injected from dictionary.js to avoid circular deps.
- */
+
 export async function learnDictionary(fieldName, rawValue, normRaw, threshold, jaroWinkler, normalize) {
   const db = getPool();
-  if (!db) return; // gracefully skip when no DB is configured
+  if (!db) return;
 
-  // 1. Exact canonical match (case-insensitive) → just increment hit_count
+  // exact canonical match (case-insensitive) -> increment hit_count
   const exact = await db.query(
     'SELECT id, aliases FROM field_dictionary WHERE field_name = $1 AND lower(canonical) = lower($2)',
     [fieldName, rawValue],
@@ -84,7 +94,7 @@ export async function learnDictionary(fieldName, rawValue, normRaw, threshold, j
     return;
   }
 
-  // 2. Fuzzy match against existing canonicals / aliases → add as alias
+  // fuzzy match against existing canonicals / aliases -> add as alias
   const all = await db.query(
     'SELECT id, canonical, aliases FROM field_dictionary WHERE field_name = $1',
     [fieldName],
@@ -100,7 +110,6 @@ export async function learnDictionary(fieldName, rawValue, normRaw, threshold, j
     }
   }
   if (bestMatch) {
-    // Avoid duplicate aliases
     if (!bestMatch.aliases.some((a) => a.toLowerCase() === rawValue.toLowerCase())) {
       bestMatch.aliases.push(rawValue);
       await db.query(
@@ -116,25 +125,25 @@ export async function learnDictionary(fieldName, rawValue, normRaw, threshold, j
     return;
   }
 
-  // 3. Completely new value → insert as a new canonical entry
+  //  completely new value -> insert as new canonical entry
   await db.query(
     'INSERT INTO field_dictionary (id, field_name, canonical, aliases, hit_count) VALUES ($1,$2,$3,$4,1)',
     [crypto.randomUUID(), fieldName, rawValue, '[]'],
   );
 }
 
-/**
- * Delete a dictionary entry by ID.
- */
+
+ // delete a dictionary entry by ID
+
 export async function deleteDictionaryEntry(id) {
   const db = getPool();
   if (!db) throw new Error('DATABASE_URL is not configured.');
   await db.query('DELETE FROM field_dictionary WHERE id = $1', [id]);
 }
 
-/**
- * Save user-corrected data back onto an extraction run and return the updated row.
- */
+
+// save user-corrected data back onto an extraction run and return the updated row
+ 
 export async function saveCorrections(runId, correctedData) {
   const db = getPool();
   if (!db) return false;
@@ -144,4 +153,3 @@ export async function saveCorrections(runId, correctedData) {
   );
   return true;
 }
-
