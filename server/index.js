@@ -6,8 +6,8 @@ import multer from 'multer';
 import os from 'node:os';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
-import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractTableWithClaude, extractTableWithGemini, extractWithClaude, extractWithGemini, lineItemQuality, matchTemplate, parseLocalTableGrid, requiredMappingStatus, runImageExtractor, runLocalExtractor, runLocalTableExtractor, summarizeLineItems } from './extraction.js';
-import { getActiveTemplates, getRunById, markTemplateMatched, saveCorrections, saveRun, saveTemplate } from './database.js';
+import { applyTemplate, buildTemplateProposal, confidence, emptyOrder, extractByRules, extractLayoutStructure, extractTableWithClaude, extractTableWithGemini, extractWithClaude, extractWithGemini, lineItemQuality, matchTemplate, normalizeLineItems, reconcileInvoice, requiredMappingStatus, runImageExtractor, runLocalExtractor, runLocalTableExtractor, structureScore, summarizeLineItems } from './extraction.js';
+import { getActiveTemplates, getRunById, recordTemplateOutcome, saveCorrections, saveRun, saveTemplate } from './database.js';
 import { applyDictionary, learnFromData, listDictionary, removeDictionaryEntry } from './dictionary.js';
 
 const ACCEPTED_MIME_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/tiff']);
@@ -26,8 +26,8 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   const mimeType = req.file.mimetype;
   const isPdf = mimeType === 'application/pdf';
   const extractionMethod = req.body.extractionMethod || 'auto';
-  if (!['auto', 'pdfplumber', 'tesseract', 'ai'].includes(extractionMethod)) {
-    return res.status(400).json({ error: 'Choose automatic, PDFPlumber (PDF only), Tesseract, or AI-assisted extraction.' });
+  if (!['auto', 'pdfplumber', 'tesseract', 'ai', 'local'].includes(extractionMethod)) {
+    return res.status(400).json({ error: 'Choose automatic, PDFPlumber (PDF only), Tesseract, Local OCR, or AI-assisted extraction.' });
   }
   const id = crypto.randomUUID();
   const ext = MIME_TO_EXT[mimeType] || '.bin';
@@ -41,24 +41,42 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
   try {
     await fs.writeFile(filePath, req.file.buffer);
     let text = '';
+    let localEarly = null;
 
     if (isPdf) {
       // ── PDF pipeline ────────────────────────────────────────────────────────
-      if (extractionMethod !== 'tesseract') {
-        const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
-        if (pdf) text = pdf.text;
-      }
-      if (extractionMethod === 'tesseract' || ((extractionMethod === 'auto' || extractionMethod === 'ai') && !text.trim())) {
-        const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
-        if (ocr) text = ocr.text;
+      if (extractionMethod === 'local') {
+        // Their ported local engine (EasyOCR full-page + spatial table) only.
+        localEarly = await tryStep('local_ocr', () => runLocalTableExtractor(filePath));
+        if (localEarly) text = localEarly.fullText || localEarly.text || '';
+      } else {
+        if (extractionMethod !== 'tesseract') {
+          const pdf = await tryStep('pdfplumber', () => runLocalExtractor('pdfplumber', filePath));
+          if (pdf) text = pdf.text;
+        }
+        if (extractionMethod === 'tesseract' || ((extractionMethod === 'auto' || extractionMethod === 'ai') && !text.trim())) {
+          const ocr = await tryStep('tesseract_ocr', () => runLocalExtractor('ocr', filePath));
+          if (ocr) text = ocr.text;
+        }
       }
     } else {
       // ── Image pipeline ───────────────────────────────────────────────────────
+      // Header/summary source stays Tesseract (clean labelled lines -> correct
+      // totals; full-EasyOCR headers regressed totals). Their EasyOCR full-page
+      // engine feeds the raw-text preview + the spatial table engine (below),
+      // so the UI raw text matches invoice-ocr-c++. The 'local' mode runs their
+      // ported engine only — no Tesseract, no AI.
       if (extractionMethod !== 'ai') {
-        const ocr = await tryStep('tesseract_ocr', () => runImageExtractor(filePath));
-        if (ocr) text = ocr.text;
+        if (extractionMethod === 'local') {
+          localEarly = await tryStep('local_ocr', () => runLocalTableExtractor(filePath));
+          if (localEarly) text = localEarly.fullText || localEarly.text || '';
+        } else {
+          const ocr = await tryStep('tesseract_ocr', () => runImageExtractor(filePath));
+          if (ocr) text = ocr.text;
+        }
       }
     }
+    let rawPreview = text;
 
     const templates = await getActiveTemplates();
     const match = matchTemplate(text, templates);
@@ -74,45 +92,62 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       const mappingStatus = requiredMappingStatus(data, match.template.formMapping);
       const requiredDetail = mappingStatus.required.length ? `; ${mappingStatus.required.length - mappingStatus.missing.length}/${mappingStatus.required.length} required form fields filled` : '';
       attempts.push({ name: 'saved_template', status: 'completed', confidence: confidence(data), detail: `${match.template.name} (${Math.round(match.score * 100)}% match)${requiredDetail}` });
-      await markTemplateMatched(templateId);
+      // Reliability/lifecycle: counts this match as a success only when the
+      // template actually filled the form well (drives DRAFT->ACTIVE and
+      // ACTIVE->QUARANTINED).
+      await recordTemplateOutcome(templateId, { success: confidence(data) >= 0.75, confidence: confidence(data) });
     } else {
       data = extractByRules(text);
       attempts.push({ name: 'dictionary_rules', status: 'completed', confidence: confidence(data) });
     }
 
    
-    const looksTabular = data.lineItems.length > 0 || /\n[^\n]*\t[^\n]*\n/.test(text);
-    const lineItemsWeak = !data.lineItems.length || lineItemQuality(data.lineItems) < 0.6;
+    const looksTabular = extractionMethod === 'local' || data.lineItems.length > 0 || /\n[^\n]*\t[^\n]*\n/.test(text);
+    const currentQuality = data.lineItems.length ? lineItemQuality(data.lineItems) : 0;
     let localTableStrong = false;
-    if (looksTabular && extractionMethod !== 'tesseract' && lineItemsWeak) {
-      const local = await (async () => {
+    // Local table OCR (their ported spatial cell-grid engine) runs for every
+    // tabular document and is preferred whenever its parse is at least as
+    // coherent as the deterministic/template parse — so geometry resolves
+    // qty/rate that text OCR mangles (e.g. GST qty "3"). In 'local' mode the
+    // engine already ran (localEarly) and is reused here — no double run.
+    if (looksTabular && extractionMethod !== 'tesseract') {
+      const local = localEarly || await (async () => {
         try { const v = await runLocalTableExtractor(filePath); attempts.push({ name: 'table_ocr', status: 'completed' }); return v; }
         catch (error) { attempts.push({ name: 'table_ocr', status: 'failed', detail: error.message }); return null; }
       })();
+      // Their EasyOCR full-page raw text rides along on the table pass (same
+      // word boxes) — makes the UI raw-text preview match invoice-ocr-c++.
+      if (local?.fullText) rawPreview = local.fullText;
       if (local && local.text) {
-        const localItems = parseLocalTableGrid(local.text);
+        // The worker's table mode returns structured line items straight from
+        // their spatial cell-grid engine (EasyOCR + RapidOCR, pick-best).
+        const localItems = Array.isArray(local.lineItems) && local.lineItems.length
+          ? normalizeLineItems(local.lineItems)
+          : [];
         const localQuality = lineItemQuality(localItems);
-        if (localItems.length && localQuality >= 0.6) {
+        if (localItems.length && localQuality >= 0.6 && localQuality >= currentQuality) {
           data.lineItems = localItems;
           localTableStrong = true;
           attempts.at(-1).confidence = localQuality;
-          attempts.at(-1).detail = `${localItems.length} items read locally (RapidOCR)`;
+          attempts.at(-1).detail = `${localItems.length} items read locally (spatial)`;
           // Fill any totals that were not labelled on the document (derivable
           // from the parsed table); labelled summary lines keep priority.
           const computed = summarizeLineItems(data.lineItems);
           for (const [k, v] of Object.entries(computed)) {
             if (v && !data[k]) data[k] = v;
           }
-        } else {
-          
+        } else if (localItems.length) {
           attempts.at(-1).status = 'failed';
-          attempts.at(-1).detail = localItems.length
-            ? `quality ${localQuality.toFixed(2)} < 0.6 — using AI table fallback`
-            : 'no usable table structure — using AI table fallback';
+          attempts.at(-1).detail = localQuality < 0.6
+            ? `quality ${localQuality.toFixed(2)} < 0.6 — keeping deterministic`
+            : `spatial quality ${localQuality.toFixed(2)} ≤ deterministic ${currentQuality.toFixed(2)} — keeping deterministic`;
+        } else {
+          attempts.at(-1).status = 'failed';
+          attempts.at(-1).detail = 'no usable table structure';
         }
       } else if (local) {
         attempts.at(-1).status = 'failed';
-        attempts.at(-1).detail = 'no table text returned — using AI table fallback';
+        attempts.at(-1).detail = 'no table text returned';
       }
     }
 
@@ -142,7 +177,7 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
 
    
     const mainAiRan = ['anthropic_claude', 'gemini_3_pro'].includes(source);
-    const needsAiTable = looksTabular && extractionMethod !== 'tesseract' && !mainAiRan && !localTableStrong
+    const needsAiTable = looksTabular && extractionMethod !== 'tesseract' && extractionMethod !== 'local' && !mainAiRan && !localTableStrong
       && (!data.lineItems.length || lineItemQuality(data.lineItems) < 0.6);
     if (needsAiTable) {
       for (const provider of [
@@ -162,10 +197,43 @@ app.post('/api/extractions', upload.single('file'), async (req, res, next) => {
       learnFromData(data).catch(() => {});
     }
 
+    // ── Arithmetic audit (informational): line items + taxes vs totals ──
+    const validation = reconcileInvoice(data);
+
+    // ── Auto-learn a DRAFT template for a genuinely new, well-understood
+    //    layout so repeat documents resolve deterministically WITHOUT AI.
+    //    The lifecycle promotes it to ACTIVE after 2 successful matches. ──
+    if (!match && !templateId && confidence(data) >= 0.75) {
+      const struct = extractLayoutStructure(text);
+      const alreadyCovered = templates.some((t) => {
+        const ts = t.fingerprint?.structure;
+        return ts && (ts.columnFields?.length || ts.columnHeaders?.length || ts.keyLabels?.length) && structureScore(ts, struct) >= 0.85;
+      });
+      if (!alreadyCovered) {
+        const proposal = buildTemplateProposal(text, data);
+        const draftId = await saveTemplate({
+          name: `${data.vendorName || 'Layout'} (auto)`,
+          fingerprint: proposal.fingerprint,
+          fieldRules: proposal.fieldRules,
+          formMapping: {},
+          status: 'draft',
+        }).catch(() => null);
+        if (draftId) attempts.push({ name: 'auto_template', status: 'completed', detail: 'saved DRAFT template for this layout' });
+      }
+    }
+
     proposedTemplate ??= buildTemplateProposal(text, data);
-    const run = { id, fileName: req.file.originalname, mimeType, data, source, templateId, confidence: confidence(data), attempts, text };
+    const matchedTemplate = match ? {
+      name: match.template.name,
+      status: match.template.status,
+      timesMatched: match.template.timesMatched || 0,
+      successCount: match.template.successCount || 0,
+      anchorScore: match.anchorScore,
+      structureScore: match.structureScore,
+    } : null;
+    const run = { id, fileName: req.file.originalname, mimeType, data, source, templateId, confidence: confidence(data), attempts, text, validation };
     const persisted = await saveRun(run).catch((error) => { attempts.push({ name: 'postgres', status: 'failed', detail: error.message }); return false; });
-    res.status(201).json({ ...run, text: undefined, persisted, proposedTemplate, dictionaryHits, preview: text.slice(0, 1200) });
+    res.status(201).json({ ...run, text: undefined, persisted, proposedTemplate, template: matchedTemplate, dictionaryHits, preview: rawPreview.slice(0, 1200), rawText: rawPreview });
   } catch (error) { next(error); } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });
 

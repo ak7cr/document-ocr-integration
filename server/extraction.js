@@ -63,7 +63,13 @@ export function amount(value) {
   // ("Rs." / "$.") is not captured as part of the number.
   const m = String(value).match(/\d[\d, .]*/);
   if (!m) return '';
-  let s = m[0].trim();
+  let raw = m[0];
+  // EasyOCR sometimes glues a single leading noise digit onto a labelled amount
+  // ("0 5201.00", "1 456.12" for ₹1,456.12). When exactly one digit is separated
+  // by a space from a well-formed decimal, drop the noise digit.
+  const noise = raw.match(/^(\d) (\d[\d,]*\.\d{1,2})$/);
+  if (noise) raw = noise[2];
+  let s = raw.trim();
   const lastComma = s.lastIndexOf(',');
   const lastDot = s.lastIndexOf('.');
   if (lastComma > lastDot && s.length - lastComma <= 3) {
@@ -362,129 +368,101 @@ export function extractLineItems(text) {
 }
 
 
-function classifyLocalColumn(label) {
-  const l = clean(label).toLowerCase();
-  if (!l) return null;
-  if (/^(no\.?|s\.?no\.?|sr\.?no\.?|sl\.?no\.?|#|serial)$/.test(l) || /^no$/.test(l)) return 'serialNo';
-  if (/desc|item|particular|product|name|goods|service/.test(l)) return 'itemName';
-  if (/hsn|sac|itc\s*code/.test(l)) return 'hsnSac';
-  if (/qty|quantity/.test(l)) return 'quantity';
-  if (/^(um|uom|unit|uinit|unt)$/.test(l)) return 'unit';
-  if (/disc/.test(l)) return 'discount';
-  if (/cgst/.test(l)) return 'cgstAmount';
-  if (/sgst/.test(l)) return 'sgstAmount';
-  if (/igst/.test(l)) return 'igstAmount';
-  if (/taxable/.test(l)) return 'taxableValue';
-  if (/vat|gst|tax/.test(l) && /%/.test(l)) return 'tax';
-  if (/gross|grand\s+total/.test(l)) return 'grossAmount';
-  if (/rate|unit\s*price|unit\s*cost|net\s*price|\bprice\b/.test(l)) return 'rate';
-  if (/vat|gst|tax/.test(l)) return 'tax';
-  if (/amount|worth|value|net/.test(l)) return 'amount';
-  return null;
-}
+// ── layout structure signature ───────────────────────────────────────────────
+// Templates also record a structural fingerprint of the layout (table column
+// fields, key labels, header position) so matching is not anchor-only: a saved
+// template must LOOK like the same layout, not just contain the same words.
+// This is what lets a saved template resolve repeat documents deterministically
+// (no AI) ~8/10 times, even when vendor/values change.
 
-/** Strip leading checkbox / currency artifacts (□ ☑ ☐ ₹ $ € £) from a cell. */
-const stripGlyphs = (value = '') => String(value).replace(/^[\s\u25a1\u2611\u2610\u20b9$€£]*/, '').trim();
+const STRUCTURAL_LABELS = [
+  'gstin', 'tax invoice', 'invoice', 'purchase order', 'sales order', 'cash memo',
+  'subtotal', 'total gst', 'total tax', 'cgst', 'sgst', 'igst', 'gst', 'vat',
+  'taxable value', 'grand total', 'total amount', 'bill to', 'ship to', 'discount',
+  'item', 'qty', 'rate', 'amount', 'hsn', 'reverse charge', 'place of supply',
+];
 
-export function parseLocalTableGrid(gridText) {
-  const rows = String(gridText).split(/\r?\n/)
+function tableStructureSignature(text) {
+  const rows = String(text).split(/\r?\n/)
     .map((line) => line.split('\t').map((c) => c.trim()))
     .filter((row) => row.some(Boolean));
-  const isHeader = (row) => row.some((c) => /desc|item|particular|product|service/i.test(c))
+  const isItemsHeader = (row) => row.some((c) => /desc|item|particular|product|service/i.test(c))
     && row.some((c) => /qty|quantity|rate|price|amount|worth|vat|gst|cgst|sgst|igst|hsn|^no/i.test(c));
-  const headerIdx = rows.findIndex(isHeader);
-  if (headerIdx < 0) return [];
+  const headerIdx = rows.findIndex(isItemsHeader);
+  const header = headerIdx >= 0 ? rows[headerIdx] : [];
+  const norm = (c) => clean(c).toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const lines = String(text).split(/\r?\n/).filter((l) => l.trim());
+  return {
+    hasTable: header.length >= 2,
+    columnHeaders: header.map(norm).filter(Boolean).slice(0, 14),
+    columnFields: header.map((c) => classifyLineItemColumn(c)).filter(Boolean).slice(0, 14),
+    headerRatio: headerIdx >= 0 && lines.length ? headerIdx / lines.length : null,
+    keyLabels: STRUCTURAL_LABELS.filter((l) => new RegExp(`\\b${escapeRegex(l)}\\b`, 'i').test(text)).slice(0, 14),
+  };
+}
 
-  const colMap = {};
-  rows[headerIdx].forEach((cell, idx) => { const f = classifyLocalColumn(cell); if (f) colMap[idx] = f; });
-  const hasHsnColumn = Object.values(colMap).includes('hsnSac');
+/** 0..1 how similar the document's layout is to a saved template's layout. */
+export function structureScore(templateStruct, docStruct) {
+  if (!templateStruct || !docStruct) return 1;
+  const hasFields = templateStruct.columnFields?.length || templateStruct.columnHeaders?.length;
+  const hasLabels = templateStruct.keyLabels?.length;
+  if (!hasFields && !hasLabels) return 1; // legacy template: no structure constraint
 
-  const isSummary = (row) =>
-    (row.some((c) => /^total$/i.test(clean(c))) && row.some((c) => amount(c)))
-    || (row.some((c) => /subtotal|tax\s*summary|grand\s*total|total\s*tax|total\s*gst/i.test(c)) && !isHeader(row));
-  let end = rows.length;
-  for (let i = headerIdx + 1; i < rows.length; i++) { if (isSummary(rows[i])) { end = i; break; } }
+  let score = 0, weight = 0;
 
-  const idxOf = (field) => Object.keys(colMap).find((k) => colMap[k] === field);
-  const serialIdx = idxOf('serialNo');
-  const nameIdx = idxOf('itemName');
-  const qtyIdx = idxOf('quantity');
-  const unitIdx = idxOf('unit');
-  const rateIdx = idxOf('rate');
-  const amountIdx = idxOf('amount');
-
-  const items = [];
-  for (let i = headerIdx + 1; i < end; i++) {
-    const cells = rows[i];
-    if (!cells.length) continue;
-    const item = emptyLineItem();
-
-    // Serial from the first cell.
-    let first = cells[0] || '';
-    const sm = first.match(/^(\d{1,3})\s*[.)]\s*(.*)$/) || (/^\d{1,3}$/.test(first) ? first.match(/^(\d{1,3})/) : null);
-    if (sm) { item.serialNo = sm[1]; if (sm[2]) first = sm[2]; }
-
-    // Item name, with an embedded 4-8 digit HSN/SAC code split out (only when
-    // there is no dedicated HSN column).
-    let name = '';
-    if (nameIdx != null && cells[Number(nameIdx)] && cells[Number(nameIdx)] !== cells[0]) name = cells[Number(nameIdx)];
-    else name = sm?.[2] || first;
-    name = stripGlyphs(name).replace(/\s+/g, ' ').trim();
-    const hm = name.match(/^(.*?)\s+(\d{4,8})\s+(.*)$/);
-    if (hm && !hasHsnColumn) { item.itemName = [hm[1], hm[3]].filter(Boolean).join(' ').trim(); item.hsnSac = hm[2]; }
-    else item.itemName = name;
-
-    // Unit.
-    if (unitIdx != null) { const u = stripGlyphs(cells[Number(unitIdx)]); if (u && !isLineItemNumber(u)) item.unit = u; }
-
-    // Value tokens (exclude serial/name/unit columns).
-    const excluded = new Set([0, serialIdx, nameIdx, unitIdx].map((x) => (x == null ? -1 : Number(x))));
-    const tokens = [];
-    for (let ci = 0; ci < cells.length; ci++) {
-      if (excluded.has(ci)) continue;
-      for (const t of cells[ci].split(/\s+/)) {
-        const cleanT = stripGlyphs(t);
-        if (cleanT) tokens.push(cleanT);
-      }
-    }
-
-    const numbers = [], percents = [];
-    for (const t of tokens) {
-      if (/%/.test(t)) percents.push(t);
-      else if (isLineItemNumber(t)) numbers.push(t);
-      else if (!item.unit && LINE_ITEM_UNITS.has(t.toLowerCase())) item.unit = t;
-    }
-    const toNum = (t) => { const a = amount(t); return a ? Number(a) : null; };
-
-    // Quantity: its column first, else a small integer token.
-    if (qtyIdx != null) { const q = stripGlyphs(cells[Number(qtyIdx)]); if (q && isLineItemNumber(q)) item.quantity = amount(q); }
-    if (!item.quantity) {
-      const q = numbers.find((n) => /^\d{1,3}$/.test(n.replace(/[.,]\d{2}$/, '')) && toNum(n) < 1000);
-      if (q) { item.quantity = amount(q); numbers.splice(numbers.indexOf(q), 1); }
-    }
-
-    // Rate: its column first, else first number.
-    if (rateIdx != null) { const r = stripGlyphs(cells[Number(rateIdx)]); if (r && isLineItemNumber(r)) item.rate = amount(r); }
-    if (!item.rate) { const r = numbers.shift(); if (r) item.rate = amount(r); }
-
-    // Amount: its column first, else the dominant (largest) remaining number.
-    if (amountIdx != null) { const a = stripGlyphs(cells[Number(amountIdx)]); if (a && isLineItemNumber(a)) item.amount = amount(a); }
-    if (!item.amount) {
-      const nums = numbers.map(toNum).filter((n) => n != null);
-      if (nums.length) {
-        const max = Math.max(...nums);
-        const t = numbers.find((n) => toNum(n) === max);
-        if (t) { item.amount = amount(t); numbers.splice(numbers.indexOf(t), 1); }
-      }
-    }
-
-    // Percentages: two+ → discount then tax; one → tax.
-    if (percents.length >= 2) { item.discount = percents[0].replace(/\s+/g, ''); item.tax = percents[1].replace(/\s+/g, ''); }
-    else if (percents.length === 1) item.tax = percents[0].replace(/\s+/g, '');
-
-    if (item.itemName || item.rate || item.amount) items.push(splitSerialFromHsn(item));
+  const tFields = templateStruct.columnFields || [];
+  if (tFields.length) {
+    const dFields = new Set(docStruct.columnFields || []);
+    const hit = tFields.filter((f) => dFields.has(f)).length / tFields.length;
+    score += 0.55 * hit; weight += 0.55;
+  } else if (templateStruct.columnHeaders?.length) {
+    const tH = templateStruct.columnHeaders.map((h) => h.replace(/\s+/g, ' ').trim());
+    const dH = new Set((docStruct.columnHeaders || []).map((h) => h.replace(/\s+/g, ' ').trim()));
+    const hit = tH.filter((h) => dH.has(h)).length / tH.length;
+    score += 0.55 * hit; weight += 0.55;
   }
-  return items;
+
+  const tLabels = templateStruct.keyLabels || [];
+  if (tLabels.length) {
+    const dLabels = new Set(docStruct.keyLabels || []);
+    score += 0.30 * tLabels.filter((l) => dLabels.has(l)).length / tLabels.length; weight += 0.30;
+  }
+
+  if (templateStruct.headerRatio != null && docStruct.headerRatio != null) {
+    const closeness = Math.max(0, 1 - Math.abs(templateStruct.headerRatio - docStruct.headerRatio) / 0.15);
+    score += 0.15 * closeness; weight += 0.15;
+  }
+
+  return weight ? score / weight : 1;
+}
+
+export function extractLayoutStructure(text) {
+  return tableStructureSignature(text);
+}
+
+/** Lightweight arithmetic audit: line items + taxes vs reported totals. */
+export function reconcileInvoice(data) {
+  const issues = [];
+  const toNum = (v) => { const n = toNumber(v); return n == null ? null : n; };
+  const items = Array.isArray(data.lineItems) ? data.lineItems : [];
+  const check = (label, got, expected, tol = 2.5) => {
+    if (got == null || expected == null) return;
+    if (Math.abs(got - expected) > tol) issues.push(`${label}: ${got} vs ${expected}`);
+  };
+
+  let lineSum = 0, hasLines = false, taxParts = 0, hasTaxParts = false;
+  for (const it of items) {
+    let amt = toNum(it.amount);
+    if (amt == null && it.quantity && it.rate) { const q = toNum(it.quantity), r = toNum(it.rate); if (q != null && r != null) amt = q * r; }
+    if (amt != null) { lineSum += amt; hasLines = true; }
+    const t = [toNum(it.cgstAmount), toNum(it.sgstAmount), toNum(it.igstAmount)].filter((v) => v != null);
+    if (t.length) { taxParts += t.reduce((a, b) => a + b, 0); hasTaxParts = true; }
+  }
+  const sub = toNum(data.subtotalAmount), tax = toNum(data.taxAmount), total = toNum(data.totalAmount);
+  if (hasLines) check('line items vs subtotal', lineSum, sub);
+  if (hasTaxParts) check('CGST+SGST+IGST vs tax', taxParts, tax);
+  if (sub != null && tax != null && total != null) check('subtotal+tax vs total', sub + tax, total);
+  return { ok: issues.length === 0, issues };
 }
 
 /** Parse a value like "1 394,67" / "10%" into a number (or null). */
@@ -778,6 +756,7 @@ export function matchTemplate(text, templates) {
   const normalized = normalizeText(text).toLowerCase();
   const docIsSales = /sales\s+order|\bS\.?O\.?\b|so details/i.test(normalized);
   const docIsPurchase = /purchase\s+order|\bP\.?O\.?\b|p\.o\. details/i.test(normalized);
+  const docStructure = tableStructureSignature(text);
 
   let best = null;
   for (const template of templates) {
@@ -791,10 +770,25 @@ export function matchTemplate(text, templates) {
     if (templateIsPurchase && !docIsPurchase) continue;
 
     const matches = anchors.filter((anchor) => normalized.includes(anchor.toLowerCase())).length;
-    const score = matches / anchors.length;
-    if (!best || score > best.score) best = { template, score };
+    const anchorScore = matches / anchors.length;
+
+    // Dual gate: anchors must be present AND the document must look like the
+    // same layout (column fields / labels / header position). Draft templates
+    // need a higher bar; legacy templates (no structure) use anchor-only.
+    const tStruct = template.fingerprint?.structure;
+    const hasStructure = Boolean(tStruct && (tStruct.columnFields?.length || tStruct.columnHeaders?.length || tStruct.keyLabels?.length));
+    const struct = hasStructure ? structureScore(tStruct, docStructure) : 1;
+    const composite = 0.55 * anchorScore + 0.45 * struct;
+
+    const isDraft = template.status === 'draft';
+    const pass = hasStructure
+      ? anchorScore >= (isDraft ? 0.8 : 0.7) && struct >= (isDraft ? 0.75 : 0.6) && composite >= (isDraft ? 0.8 : 0.72)
+      : anchorScore >= 0.65;
+    if (!pass) continue;
+
+    if (!best || composite > best.score) best = { template, score: composite, anchorScore, structureScore: struct };
   }
-  return best?.score >= 0.65 ? best : null;
+  return best || null;
 }
 
 export function confidence(data) {
@@ -863,14 +857,14 @@ export function buildTemplateProposal(text, data, name = '') {
 
   return {
     name: name || data.vendorName || 'Document template',
-    fingerprint: { anchors: [...anchors].slice(0, 10) },
+    fingerprint: { anchors: [...anchors].slice(0, 10), structure: tableStructureSignature(text) },
     fieldRules
   };
 }
 
 export async function runLocalExtractor(mode, filePath) {
-  const virtualenvPython = path.join(process.cwd(), '.venv', 'bin', 'python');
-  const python = process.env.PYTHON_BIN || (existsSync(virtualenvPython) ? virtualenvPython : 'python3');
+  const venvPythons = ['.venv', 'venv'].map((v) => path.join(process.cwd(), v, 'bin', 'python'));
+  const python = process.env.PYTHON_BIN || venvPythons.find((p) => existsSync(p)) || 'python3';
   const { stdout } = await execFileAsync(python, ['server/pdf_worker.py', mode, filePath], { timeout: 90_000, maxBuffer: 8_000_000 });
   const result = JSON.parse(stdout);
   if (!result.ok) throw new Error(result.error);
@@ -881,9 +875,9 @@ export async function runImageExtractor(filePath) {
   return runLocalExtractor('image_ocr', filePath);
 }
 
-/** Local table OCR (RapidOCR PP-Structure) — an offline, free alternative to
- * the vision-AI table pass. Returns { text, pages } where text is the table
- * serialized as a tab-separated grid. */
+/** Local table OCR (spatial cell-grid) — an offline, free alternative to
+ * the vision-AI table pass. Returns { text, pages, lineItems, fullText }
+ * where fullText is their EasyOCR full-page raw text. */
 export async function runLocalTableExtractor(filePath) {
   return runLocalExtractor('table', filePath);
 }

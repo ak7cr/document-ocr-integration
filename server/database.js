@@ -11,7 +11,7 @@ function getPool() {
 export async function getActiveTemplates() {
   const db = getPool();
   if (!db) return [];
-  const { rows } = await db.query('SELECT id, name, fingerprint, field_rules AS "fieldRules", form_mapping AS "formMapping" FROM document_templates WHERE status = $1', ['active']);
+  const { rows } = await db.query('SELECT id, name, fingerprint, field_rules AS "fieldRules", form_mapping AS "formMapping", status, times_matched AS "timesMatched", success_count AS "successCount", failure_count AS "failureCount", failure_rate AS "failureRate", avg_confidence AS "avgConfidence" FROM document_templates WHERE status IN ($1, $2)', ['active', 'draft']);
   return rows;
 }
 
@@ -36,23 +36,50 @@ export async function saveRun(run) {
   return true;
 }
 
-export async function saveTemplate({ id, name, fingerprint, fieldRules, formMapping, runId }) {
+export async function saveTemplate({ id, name, fingerprint, fieldRules, formMapping, runId, status = 'active' }) {
   const db = getPool();
   if (!db) throw new Error('DATABASE_URL is not configured. Run db/schema.sql and configure Postgres first.');
   const templateId = id || crypto.randomUUID();
   await db.query(
-    `INSERT INTO document_templates (id, name, fingerprint, field_rules, form_mapping)
-     VALUES ($1,$2,$3,$4,$5)
-     ON CONFLICT (id) DO UPDATE SET name = $2, fingerprint = $3, field_rules = $4, form_mapping = $5, updated_at = NOW()`,
-    [templateId, name, JSON.stringify(fingerprint), JSON.stringify(fieldRules), JSON.stringify(formMapping || {})],
+    `INSERT INTO document_templates (id, name, fingerprint, field_rules, form_mapping, status)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (id) DO UPDATE SET name = $2, fingerprint = $3, field_rules = $4, form_mapping = $5, status = $6, updated_at = NOW()`,
+    [templateId, name, JSON.stringify(fingerprint), JSON.stringify(fieldRules), JSON.stringify(formMapping || {}), status],
   );
   if (runId) await db.query('UPDATE extraction_runs SET template_id = $1 WHERE id = $2', [templateId, runId]);
   return templateId;
 }
 
-export async function markTemplateMatched(id) {
+/** Record a template match outcome and drive the lifecycle:
+ * DRAFT -> ACTIVE after 2 successes; ACTIVE -> QUARANTINED when the failure
+ * rate reaches >= 0.25 after >= 5 runs. Also updates reliability stats. */
+export async function recordTemplateOutcome(id, { success, confidence }) {
   const db = getPool();
-  if (db && id) await db.query('UPDATE document_templates SET times_matched = times_matched + 1, updated_at = NOW() WHERE id = $1', [id]);
+  if (!db || !id) return;
+  const conf = Number.isFinite(confidence) ? confidence : 0;
+  const { rows } = await db.query(
+    'SELECT status, times_matched, success_count, failure_count, avg_confidence FROM document_templates WHERE id = $1',
+    [id],
+  );
+  if (!rows.length) return;
+  const t = rows[0];
+  const times = (t.times_matched || 0) + 1;
+  const successes = (t.success_count || 0) + (success ? 1 : 0);
+  const failures = (t.failure_count || 0) + (success ? 0 : 1);
+  const failureRate = failures / times;
+  const avgConf = t.avg_confidence == null ? conf : 0.8 * t.avg_confidence + 0.2 * conf;
+
+  let status = t.status;
+  if (status === 'draft' && successes >= 2) status = 'active';
+  else if (status === 'active' && times >= 5 && failureRate >= 0.25) status = 'quarantined';
+
+  await db.query(
+    `UPDATE document_templates SET
+       times_matched = $2, success_count = $3, failure_count = $4, failure_rate = $5,
+       avg_confidence = $6, status = $7, updated_at = NOW()
+     WHERE id = $1`,
+    [id, times, successes, failures, failureRate, avgConf, status],
+  );
 }
 
 //  Dictionary

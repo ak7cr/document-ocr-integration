@@ -4,18 +4,12 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
-    "dev:api": "node --watch server/index.js",
+    "dev:api": "venv/bin/uvicorn backend.main:app --reload --port 8000",
     "dev:web": "vite --config client/vite.config.js",
-    "start": "node server/index.js",
-    "db:init": "psql \"$DATABASE_URL\" -f db/schema.sql"
+    "start": "venv/bin/uvicorn backend.main:app --port 8000",
+    "db:init": "venv/bin/python -c \"from backend.database import init_db; init_db()\""
   },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.6.1",
-    "express": "^5.1.0",
-    "multer": "^2.0.2",
-    "pg": "^8.16.3"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.12",
     "@vitejs/plugin-react": "^5.0.2",

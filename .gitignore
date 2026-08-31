@@ -6,3 +6,8 @@ uploads/
 __pycache__/
 *.pyc
 venv
+.venv
+.DS_Store
+templates.db
+invoice-ocr-c++
+invoice-ocr-line-system
