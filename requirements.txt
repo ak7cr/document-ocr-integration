@@ -1,5 +1,21 @@
-pdfplumber>=0.11
-pytesseract>=0.3
-Pillow>=10
-PyMuPDF>=1.24
+# FastAPI backend (imported invoice-ocr-c++ system)
+fastapi>=0.110.0
+uvicorn>=0.28.0
+python-multipart>=0.0.9
+pydantic>=2.6.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.0
+pymupdf>=1.23.0
+pdfplumber>=0.10.0
+pypdf>=4.0.0
+pillow>=10.2.0
+opencv-python>=4.9.0
+numpy>=1.26.0
+httpx>=0.27.0
+google-genai>=0.1.0
+# AI vision primary + OCR engines (heavy, install manually into venv):
+# easyocr, torch
+# (paddleocr is optional and unavailable on Python >= 3.13 — EasyOCR is the
+#  effective engine; the code falls back gracefully if it's absent.)
 

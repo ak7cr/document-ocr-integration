@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS document_templates (
   fingerprint JSONB NOT NULL,
   field_rules JSONB NOT NULL,
   form_mapping JSONB NOT NULL DEFAULT '{}'::jsonb,
-  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'draft', 'archived')),
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'draft', 'archived', 'quarantined')),
   times_matched INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -51,3 +51,9 @@ CREATE INDEX IF NOT EXISTS field_dictionary_field_idx ON field_dictionary (field
 -- Allow corrections to be stored back on an extraction run
 ALTER TABLE extraction_runs ADD COLUMN IF NOT EXISTS corrected_data JSONB;
 ALTER TABLE extraction_runs ADD COLUMN IF NOT EXISTS corrected_at TIMESTAMPTZ;
+
+-- Template reliability & lifecycle (robust layout reuse without AI)
+ALTER TABLE document_templates ADD COLUMN IF NOT EXISTS success_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE document_templates ADD COLUMN IF NOT EXISTS failure_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE document_templates ADD COLUMN IF NOT EXISTS failure_rate NUMERIC(5,4) NOT NULL DEFAULT 0;
+ALTER TABLE document_templates ADD COLUMN IF NOT EXISTS avg_confidence NUMERIC(5,4);

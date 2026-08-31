@@ -152,7 +152,7 @@ function App() {
             <option value="auto">Automatic (Tesseract → AI fallback)</option>
             <option value="ai">AI-assisted (Claude → Gemini, always)</option>
             {!isImage && <option value="pdfplumber">PDFPlumber only (PDF)</option>}
-            <option value="tesseract">Tesseract OCR only</option>
+            <option value="local">Local OCR only (EasyOCR, no AI)</option>
           </select>
         </label>
 
@@ -285,7 +285,7 @@ function App() {
             </div>
             <div className="mt-3 flex flex-wrap gap-2">{result.attempts.map((attempt) => <span key={attempt.name} title={attempt.detail} className={`rounded-full px-3 py-1 text-xs font-medium ${attempt.status === 'completed' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>{attempt.name.replaceAll('_', ' ')} · {attempt.status}</span>)}</div>
           </div>
-          <details className="mt-5 text-sm"><summary className="cursor-pointer font-medium text-slate-600">View extracted text preview</summary><pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-slate-950 p-3 whitespace-pre-wrap text-xs text-slate-300">{result.preview || 'No text recovered.'}</pre></details>
+          <details className="mt-5 text-sm"><summary className="cursor-pointer font-medium text-slate-600">View extracted text preview</summary><pre className="mt-3 max-h-48 overflow-auto rounded-lg bg-slate-950 p-3 whitespace-pre-wrap text-xs text-slate-300">{result.rawText || result.preview || 'No text recovered.'}</pre></details>
         </>}
       </div>
     </section>
