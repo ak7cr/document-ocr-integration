@@ -6,10 +6,10 @@ const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/tif
 
 
 const FIELD_SCHEMA = [
-  { key: 'documentType', label: 'Document type', type: 'select', options: ['purchase_order', 'sales_order'] },
-  { key: 'documentNumber', label: 'Order number', type: 'text' },
-  { key: 'documentDate', label: 'Order date', type: 'text' },
-  { key: 'vendorName', label: 'Vendor / supplier', type: 'text' },
+  { key: 'documentType', label: 'Invoice type', type: 'select', options: ['tax_invoice', 'invoice'] },
+  { key: 'documentNumber', label: 'Invoice number', type: 'text' },
+  { key: 'documentDate', label: 'Invoice date', type: 'text' },
+  { key: 'vendorName', label: 'Vendor / seller', type: 'text' },
   { key: 'customerName', label: 'Customer / buyer', type: 'text' },
   { key: 'currency', label: 'Currency', type: 'text' },
   { key: 'subtotalAmount', label: 'Subtotal', type: 'number' },
@@ -21,7 +21,7 @@ const labelFor = (key) => schemaFor(key)?.label || key;
 const blank = Object.fromEntries(FIELD_SCHEMA.map((f) => [f.key, '']));
 const requiredFormFields = new Set(['documentNumber', 'documentDate', 'vendorName', 'totalAmount']);
 const formMapping = Object.fromEntries(FIELD_SCHEMA.map((f) => [f.key, { sourceField: f.key, required: requiredFormFields.has(f.key) }]));
-const DOC_TYPE_LABELS = { purchase_order: 'Purchase order', sales_order: 'Sales order' };
+const INVOICE_TYPE_LABELS = { tax_invoice: 'Tax invoice', invoice: 'Invoice' };
 
 // ─── Line items table ────────────────────────────────────────────────────────
 
@@ -149,7 +149,7 @@ function App() {
 
         <label className="mt-4 block text-sm font-medium text-slate-300">Text extraction method
           <select id="extraction-method-select" value={extractionMethod} onChange={(event) => setExtractionMethod(event.target.value)} className="mt-1.5 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-slate-100 outline-none focus:border-cyan-400">
-            <option value="auto">Automatic (Tesseract → AI fallback)</option>
+            <option value="auto">Automatic (EasyOCR → AI fallback)</option>
             <option value="ai">AI-assisted (Claude → Gemini, always)</option>
             {!isImage && <option value="pdfplumber">PDFPlumber only (PDF)</option>}
             <option value="local">Local OCR only (EasyOCR, no AI)</option>
@@ -167,7 +167,7 @@ function App() {
           <ol className="mt-3 space-y-2 text-sm text-slate-400">
             {isImage
               ? <>
-                <li>1. Tesseract OCR reads the image</li>
+                <li>1. EasyOCR OCR reads the image (PaddleOCR fallback)</li>
                 <li>2. A saved template fills matching documents first</li>
                 <li>3. Dictionary normalizes vendor/customer names</li>
                 <li>4. Automatic: Claude, then Gemini kick in when confidence &lt; 75%</li>
@@ -175,7 +175,7 @@ function App() {
                 <li>6. Review, correct, then <strong>Submit Corrections</strong> to teach the dictionary</li>
               </>
               : <>
-                <li>1. PDFPlumber or Tesseract gets text</li>
+                <li>1. PDFPlumber (PDF) or EasyOCR reads the document</li>
                 <li>2. A saved template fills matching documents first</li>
                 <li>3. Dictionary normalizes vendor/customer names</li>
                 <li>4. Automatic: Claude, then Gemini only for low-confidence layouts</li>
@@ -213,7 +213,7 @@ function App() {
                   <select id={`field-${key}`} value={form[key] || ''} onChange={onChange} className={inputClass}>
                     <option value="">Not extracted</option>
                     {(schema?.options || []).map((opt) => (
-                      <option key={opt} value={opt}>{DOC_TYPE_LABELS[opt] || opt}</option>
+                      <option key={opt} value={opt}>{INVOICE_TYPE_LABELS[opt] || opt}</option>
                     ))}
                   </select>
                 ) : (
