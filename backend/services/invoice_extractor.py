@@ -2,7 +2,7 @@ import re
 import json
 import time
 import io
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from PIL import Image
 
 from ..schemas import (
@@ -63,6 +63,381 @@ def words_to_lines(words_subset: List[Dict[str, Any]]) -> List[str]:
         curr = sorted(curr, key=lambda it: it["x0"])
         lines_list.append(" ".join(it["text"] for it in curr))
     return lines_list
+
+
+# ---------------------------------------------------------------------------
+# Digital-PDF (vector text) helpers — pdfplumber often merges the whole invoice
+# page (Bill-To block + item table + summary box) into ONE giant table, so the
+# item-table header is not at rows[0]. These helpers locate it and parse items.
+# ---------------------------------------------------------------------------
+
+def _pdf_cell_norm(x: Any) -> str:
+    """Normalize a single pdfplumber table cell into a compact upper-case token."""
+    return re.sub(r"\s+", " ", str(x or "")).strip().upper()
+
+
+def _locate_pdf_table_header(rows: List[List[Any]]) -> Optional[int]:
+    """
+    Return the index of the row that actually contains the column headers.
+    A header row needs a description-type keyword AND a numeric/tax keyword
+    (so body and summary rows never trigger).
+    """
+    for i, r in enumerate(rows):
+        cells = [_pdf_cell_norm(c) for c in r]
+        if len(" ".join(cells)) < 8:
+            continue
+        has_desc = has_num = has_sno = False
+        for c in cells:
+            if not c:
+                continue
+            if (any(k in c for k in ("DESCRIPTION", "PARTICULARS", "NARRATION",
+                                     "ITEM &", "ITEM&", "PRODUCT NAME", "ITEMS"))
+                    or c == "ITEM" or c.startswith("ITEM ")):
+                has_desc = True
+            if any(k in c for k in ("HSN", "SAC", "QTY", "QUANTITY", "RATE",
+                                    "PRICE", "AMOUNT", "GROSS", "TOTAL", "CGST",
+                                    "SGST", "IGST", "VAT", "WORTH", "TAXABLE", "VALUE")):
+                has_num = True
+            if c in ("#", "NO", "NO.", "S.NO", "SL.NO", "SL NO", "SR.NO", "SR NO", "SNO"):
+                has_sno = True
+        if (has_desc or has_sno) and has_num:
+            return i
+    return None
+
+
+_PDF_SNO_COL = re.compile(r"^(#|NO\.?|S\.?NO\.?|SL\.?NO\.?|SR\.?NO\.?|SNO)$", re.I)
+_PDF_DESC_COL = re.compile(r"(DESCRIPTION|PARTICULARS|NARRATION|ITEM\s*&|ITEM|PRODUCT|SERVICE|GOODS)", re.I)
+_PDF_HSN_COL = re.compile(r"(HSN|SAC)", re.I)
+_PDF_QTY_COL = re.compile(r"(QTY|QUANTITY|QNTY)", re.I)
+_PDF_RATE_COL = re.compile(r"(RATE|PRICE)", re.I)
+_PDF_TAX_COL = re.compile(r"^(CGST|SGST|IGST|VAT|TAX)", re.I)
+_PDF_AMT_COL = re.compile(r"(AMOUNT|GROSS|TOTAL|WORTH|TAXABLE|VALUE)", re.I)
+
+
+def _pdf_parse_line_items(tables: List[Dict[str, Any]]) -> List[LineItem]:
+    """
+    Parse the real item table from pdfplumber's cell grids.
+
+    Handles merged-layout invoices where the whole page collapses into one wide
+    pdfplumber table: the header row is located by scanning, multi-row headers
+    are merged, merged qty+unit cells are split, CGST/SGST tax columns are
+    understood, and the trailing summary box is skipped.
+    """
+    items: List[LineItem] = []
+
+    for t in tables:
+        rows = t.get("data", [])
+        if not rows or len(rows) < 2:
+            continue
+        hi = _locate_pdf_table_header(rows)
+        if hi is None:
+            continue
+
+        # --- Map the primary columns from the located header row -----------
+        hdr = [_pdf_cell_norm(c) for c in rows[hi]]
+        desc_col = next((i for i, h in enumerate(hdr) if _PDF_DESC_COL.search(h)), None)
+        if desc_col is None:
+            continue
+
+        # Merge immediately-following sub-header rows (e.g. "% / Amt" under
+        # CGST/SGST) so multi-row headers classify correctly.
+        col_rows = [hdr]
+        j = hi + 1
+        while j < len(rows):
+            nxt = [_pdf_cell_norm(c) for c in rows[j]]
+            frag = [c for c in nxt if c]
+            if not frag or len(" ".join(frag)) > 60:
+                break
+            if desc_col < len(nxt) and nxt[desc_col]:
+                break  # a real data row carries the item description
+            col_rows.append(nxt)
+            j += 1
+
+        width = max(len(r) for r in col_rows)
+        heads = [
+            " ".join(r[k] for r in col_rows if k < len(r)).strip()
+            for k in range(width)
+        ]
+
+        desc_col = next((i for i, h in enumerate(heads) if _PDF_DESC_COL.search(h)), None)
+        if desc_col is None:
+            continue
+        sno_col = next((i for i, h in enumerate(heads) if _PDF_SNO_COL.search(h)), None)
+        hsn_col = next((i for i, h in enumerate(heads) if _PDF_HSN_COL.search(h)), None)
+        qty_col = next((i for i, h in enumerate(heads) if _PDF_QTY_COL.search(h)), None)
+        rate_col = next((i for i, h in enumerate(heads)
+                         if _PDF_RATE_COL.search(h) and not _PDF_QTY_COL.search(h)), None)
+        amt_col = next((i for i, h in enumerate(heads)
+                        if _PDF_AMT_COL.search(h)
+                        and not _PDF_TAX_COL.search(h)
+                        and not _PDF_RATE_COL.search(h)
+                        and not _PDF_QTY_COL.search(h)), None)
+
+        def _cell(row: List[str], col: Optional[int]) -> str:
+            return row[col] if col is not None and col < len(row) else ""
+
+        for idx in range(j, len(rows)):
+            row = [_pdf_cell_norm(c) for c in rows[idx]]
+            row += [""] * (width - len(row))
+            joined = " ".join(row).strip()
+            if not joined:
+                continue
+
+            desc = _cell(row, desc_col)
+            sno = _cell(row, sno_col)
+
+            # A serial number is short & (mostly) numeric. If a long wordy blob
+            # sits in the serial column it is bundled summary text (Zoho-style
+            # layout), not an item row.
+            sno_ok = bool(re.match(r"^[A-Z]{0,4}\d{1,6}[\.\)]?$", sno))
+
+            # Skip empty rows and the summary/notes rows pdfplumber bundles in.
+            if not desc and not sno_ok:
+                continue
+            if desc and (
+                re.match(r"^(SUB\s*TOTAL|SUBTOTAL|TOTAL|GRAND\s*TOTAL|CGST|SGST|IGST|TAX\b|BALANCE\s*DUE|PAYMENT\s*MADE|PAID\b|NOTES|TOTAL\s+IN\s+WORDS|THANKS|AMOUNT\s+PAYABLE|AUTHORIZED|TERMS\b|DELIVERY)", desc)
+                or (len(desc) > 60 and "TOTAL" in joined)
+            ):
+                continue
+
+            # qty / unit (may share one cell, e.g. "1.00 PCS")
+            qty_raw = _cell(row, qty_col)
+            unit = "each"
+            m_unit = re.search(r"(PCS|PIECES?|NOS|UNITS?|BOX|KGS?|GMS?|ML|LTRS?|SETS?|SET|EACH|HRS|MTRS?|PAIRS?|DZN|DOZEN|BOTTLES?|PACKS?)", qty_raw)
+            if m_unit:
+                unit = m_unit.group(1).lower()
+            qty = clean_num(qty_raw)
+            rate = clean_num(_cell(row, rate_col))
+            printed_amt = clean_num(_cell(row, amt_col))
+
+            # An item row must carry some numeric value in its numeric columns
+            # (a bare serial, or a wrapped description line, is not an item).
+            if not desc:
+                has_numeric_cell = (qty > 0 or rate > 0 or printed_amt > 0)
+            else:
+                has_numeric_cell = False
+                for c in row:
+                    if not c or c == desc:
+                        continue
+                    v = clean_num(c)
+                    if v > 0 and not re.match(r"^\d{4,8}$", c):
+                        has_numeric_cell = True
+                        break
+            if not has_numeric_cell:
+                continue
+
+            # Description cleanup (strip leading serial + any HSN that bled in)
+            d = re.sub(r"^\s*\d+\s*[\.\)\-\s]+", "", desc).strip()
+            hsn_raw = _cell(row, hsn_col)
+            hsn_m = re.search(r"\b(\d{4,8})\b", hsn_raw)
+            if hsn_m:
+                hsn_raw = hsn_m.group(1)
+            if not hsn_raw:
+                hsn_m = re.search(r"\b(\d{4,8})\b", d)
+                if hsn_m:
+                    hsn_raw = hsn_m.group(1)
+                    d = re.sub(r"\s*\b" + re.escape(hsn_raw) + r"\b", " ", d).strip()
+            d = re.sub(r"\s+", " ", d).strip()
+
+            # Arithmetic: base (taxable value) from qty x rate when available.
+            base = round(qty * rate, 2) if (qty and rate) else printed_amt
+            if base <= 0:
+                base = printed_amt
+
+            pcts = [clean_num(x) for x in re.findall(r"(\d+(?:\.\d+)?)\s*%", joined)]
+            tax_rate = round(sum(pcts), 2) if pcts else 0.0
+            tax_amount = round(base * tax_rate / 100.0, 2) if (tax_rate and base) else 0.0
+
+            # If the printed amount column already holds a gross (tax-inclusive)
+            # value that matches base + tax, honour the printed gross.
+            if (printed_amt and base and abs(printed_amt - base) > 0.01
+                    and abs(printed_amt - (base + tax_amount)) <= 0.01):
+                tax_amount = round(printed_amt - base, 2)
+                taxable = base
+                total_amount = round(printed_amt, 2)
+            else:
+                taxable = base
+                total_amount = round(base + tax_amount, 2) if tax_amount else round(printed_amt or base, 2)
+
+            if not d:
+                d = f"Item #{sno}" if sno else "Item"
+
+            items.append(LineItem(
+                sno=sno or str(len(items) + 1),
+                description=d,
+                hsn_sac=hsn_raw or None,
+                quantity=round(qty, 4) if qty else 1.0,
+                unit=unit,
+                unit_price=round(rate, 2),
+                tax_rate=tax_rate,
+                tax_amount=round(tax_amount, 2),
+                taxable_value=round(taxable, 2),
+                total_amount=round(total_amount, 2),
+            ))
+    return items
+
+
+def _parse_pdf_labeled_summary(text: str) -> Dict[str, float]:
+    """
+    Pull labelled totals from summary text in visual reading order.
+
+    Summary rows look like ``Subtotal .......... 1,10,000`` / ``CGST ..... 9,900`` /
+    ``Total ....... ₹1,29,800``. Each row is read as ``<label> <amount>`` and the
+    amount that FOLLOWS a recognised financial label is captured (amounts may be
+    parenthesised, prefixed by a minus/currency, and use Indian grouping). Rows
+    that have no recognised label (bank A/C, IFSC, PO numbers, notes ...) are
+    ignored, so footer noise can never be mistaken for a total. Returns only the
+    keys that were actually found.
+    """
+    out: Dict[str, float] = {}
+    gst_sum = 0.0
+    # Grand-total synonyms (a label line that carries the final payable amount).
+    # NOTE: "TOTAL VALUE" stays in the subtotal bucket (Indian invoices treat it
+    # as the taxable value); "TOTAL GST/TAX/IN WORDS" are not grand totals.
+    _GRAND = ("TOTAL", "GRAND TOTAL", "TOTAL AMOUNT", "TOTAL PAYABLE",
+              "TOTAL DUE", "AMOUNT PAYABLE", "NET PAYABLE",
+              "BALANCE PAYABLE", "TOTAL AMOUNT PAYABLE")
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = re.search(r"(?:[₹$€£]\s*)?\(?\s*[-−]?\s*([\d,]+(?:\.\d{1,2})?)\s*\)?\s*$", s)
+        if not m:
+            continue
+        amt = clean_num(m.group(1))
+        label = re.sub(r"\s+", " ", s[: m.start()].strip()).upper()
+        label_n = re.sub(r"\s+", "", label)
+        if (label in _GRAND or "GRAND TOTAL" in label or "GRANDTOTAL" in label_n
+                or label.endswith(" AMOUNT PAYABLE")
+                or re.search(r"(AMOUNT\s*PAYABLE|BALANCE\s*PAYABLE|NET\s*PAYABLE|AMOUNT\s*DUE|OUTSTANDING)", label)):
+            out["grand_total"] = amt
+        elif re.search(r"^(SUB\s*TOTAL|SUBTOTAL|TAXABLE\s*VALUE|TOTAL\s*BEFORE\s*TAX|TOTAL\s*VALUE)", label):
+            out.setdefault("subtotal", amt)
+        elif re.search(r"^(PAYMENT\s*MADE|AMOUNT\s*PAID|TOTAL\s*PAID|PAID|AMOUNT\s*RECEIVED|ADJUSTED)", label) or "PAYMENT MADE" in label:
+            out["amount_paid"] = amt
+        elif re.search(r"^(BALANCE\s*DUE|BALANCE|DUE|OUTSTANDING)", label):
+            out["balance_due"] = amt
+        elif re.search(r"^(CGST|SGST|IGST)", label):
+            gst_sum += amt
+        elif re.search(r"^(TOTAL\s*GST|TOTAL\s*TAX|GST\s*AMOUNT|TAX\s*AMOUNT|GST|TAX)", label):
+            out.setdefault("total_gst", amt)
+    if gst_sum > 0.0:
+        out["total_gst"] = round(gst_sum, 2)
+    if out.get("total_gst") is None and out.get("subtotal") is not None and out.get("grand_total") is not None:
+        out["total_gst"] = round(out["grand_total"] - out["subtotal"], 2)
+    return out
+
+
+def _summary_cross_validated(labelled: Dict[str, float], line_items: List[LineItem]) -> InvoiceSummary:
+    """
+    Build an InvoiceSummary from the label-driven totals AND the parsed item rows.
+
+    Each figure prefers the printed label (the amount that follows Subtotal /
+    CGST / SGST / Total / ...) and falls back to the arithmetic implied by the
+    table items (amount column for grand, qty x rate for subtotal). The grand
+    total is cross-validated: a printed value is only trusted when it agrees with
+    the item total or with subtotal + tax, otherwise a stray footer number
+    (bank A/C, IFSC, PO) can never win.
+    """
+    summary = InvoiceSummary()
+    comp_grand = round(sum((it.total_amount or 0.0) for it in line_items), 2)
+    comp_sub = round(sum(((it.unit_price or 0.0) * (it.quantity or 1.0)) for it in line_items), 2)
+    comp_tax = round(sum((it.tax_amount or 0.0) for it in line_items), 2)
+
+    subtotal = labelled.get("subtotal")
+    total_gst = labelled.get("total_gst")
+    grand = labelled.get("grand_total")
+
+    if subtotal is None and comp_sub > 0:
+        subtotal = comp_sub
+    if total_gst is None and comp_tax > 0:
+        total_gst = comp_tax
+
+    if grand is None:
+        grand = comp_grand if comp_grand > 0 else round((subtotal or 0.0) + (total_gst or 0.0), 2)
+    elif comp_grand > 0:
+        recon = round((subtotal or 0.0) + (total_gst or 0.0), 2)
+        # Cross-validation: accept the printed total only if it agrees with the
+        # item total (or subtotal + tax). Otherwise prefer the item-derived one.
+        if abs(grand - comp_grand) > 2.50 and abs(grand - recon) > 2.50 and abs(comp_grand - recon) <= 2.50:
+            grand = comp_grand
+
+    if not total_gst and grand and subtotal and grand > subtotal:
+        total_gst = round(grand - subtotal, 2)
+
+    summary.subtotal = round(subtotal or 0.0, 2)
+    summary.total_gst = round(total_gst or 0.0, 2)
+    summary.grand_total = round(grand or 0.0, 2)
+    if labelled.get("amount_paid") is not None:
+        summary.amount_paid = round(labelled["amount_paid"], 2)
+    if labelled.get("balance_due") is not None:
+        summary.balance_due = round(labelled["balance_due"], 2)
+    return summary
+
+
+def _detect_seller_block(pages: List[Dict[str, Any]], gstin: Optional[str]) -> Optional[Tuple[str, str]]:
+    """
+    Deterministic seller fallback for PDFs that have no explicit ``Seller:``
+    header (e.g. the Zoho-style layout). On GST invoices the logo/company line
+    is the text block immediately above the block carrying the GSTIN, so pick
+    that block's first line (plus the address lines above the GSTIN). Without a
+    GSTIN, use the top-most short block on the first page.
+    """
+    cands: List[Dict[str, Any]] = []
+    for p in pages:
+        for b in p.get("blocks", []):
+            txt = (b.get("text") or "").strip()
+            if not txt:
+                continue
+            cands.append({
+                "text": txt,
+                "bbox": b.get("bbox") or [0.0, 0.0, 0.0, 0.0],
+                "page": b.get("page_number", 1),
+            })
+    if not cands:
+        return None
+
+    if gstin:
+        g = re.sub(r"[^A-Z0-9]", "", gstin.upper())
+        for gb in cands:
+            if g and g in re.sub(r"[^A-Z0-9]", "", gb["text"].upper()):
+                gtop = gb["bbox"][1]
+                above = sorted(
+                    (c for c in cands if c["page"] == gb["page"] and c["bbox"][3] <= gtop - 1.0),
+                    key=lambda c: gtop - c["bbox"][3],
+                )
+                for a in above:
+                    lines = [ln.strip() for ln in a["text"].splitlines() if ln.strip()]
+                    if not lines:
+                        continue
+                    first = lines[0]
+                    if (2 <= len(first) <= 80 and not re.search(r"\d{4,}", first)
+                            and not re.search(r"INVOICE|GSTIN|BILL\s*TO|SHIP\s*TO|PAGE|AUTHORIZED|SIGNATURE", first, re.I)):
+                        # address = lines in the GSTIN block that precede it
+                        addr_lines = []
+                        for ln in gb["text"].splitlines():
+                            ls = ln.strip()
+                            if not ls:
+                                continue
+                            if re.search(r"GSTIN", ls, re.I):
+                                break
+                            if not re.search(r"(EMAIL|@|TAX\s*INVOICE|INVOICE|PHONE|TEL|WEB)", ls, re.I):
+                                addr_lines.append(ls)
+                        return first, ", ".join(addr_lines)
+        return None
+
+    # Generic: top-most short text block on the first page.
+    p1 = [c for c in cands if c["page"] == 1]
+    p1.sort(key=lambda c: (c["bbox"][1], c["bbox"][0]))
+    for a in p1:
+        lines = [ln.strip() for ln in a["text"].splitlines() if ln.strip()]
+        if not lines:
+            continue
+        first = lines[0]
+        if (2 <= len(first) <= 80 and not re.search(r"\d{4,}", first)
+                and not re.search(r"INVOICE|ORDER|GSTIN|BILL\s*TO|PAGE", first, re.I)):
+            return first, ""
+    return None
 
 
 def extract_invoice_from_image(image_bytes: bytes, preview_url: str) -> InvoiceData:
@@ -409,63 +784,32 @@ def extract_invoice_from_image(image_bytes: bytes, preview_url: str) -> InvoiceD
                     line_items.append(LineItem(sno=sno, description=desc or f"Item #{sno}", quantity=qty, unit=unit, unit_price=unit_price, tax_rate=tax_rate, total_amount=total_amount))
 
     # 4. Summary & Grand Total Extraction (below SUMMARY)
-    summary = InvoiceSummary()
     summary_words = [w for w in words_data if w["y0"] >= y_summary_header]
-    
-    # Reconstruct lines in summary area
+
+    # Reconstruct lines in the summary region (visual reading order)
     sum_lines_dict = {}
     for w in summary_words:
         yk = round(w["y0"] / 10.0) * 10
         sum_lines_dict.setdefault(yk, []).append(w)
-    
+
     sum_lines = []
     for yk in sorted(sum_lines_dict.keys()):
         lw = sorted(sum_lines_dict[yk], key=lambda w: w["x0"])
         sum_lines.append("  ".join(w["text"] for w in lw))
     sum_text = "\n".join(sum_lines)
 
-    # Labeled pattern matching for financial summary totals
-    tot_m = re.search(r"(?:Total\s*Amount|Grand\s*Total|Amount\s*Payable|Total\s*Value|Net\s*Payable)[\s\:\n₹\$€£\{\*]+(\d{1,3}(?:[\s,]\d{3})*(?:\.\d{2})|\d+(?:\.\d{2}))", sum_text, re.IGNORECASE)
-    sub_m = re.search(r"(?:Sub\s*Total|Subtotal|Taxable\s*Value|Total\s*Before\s*Tax)[\s\:\n₹\$€£\{\*]+(\d{1,3}(?:[\s,]\d{3})*(?:\.\d{2})|\d+(?:\.\d{2}))", sum_text, re.IGNORECASE)
-    gst_m = re.search(r"(?:Total\s*GST|Total\s*Tax|GST\s*Amount|Tax\s*Amount)[\s\:\n₹\$€£\{\*]+(\d{1,3}(?:[\s,]\d{3})*(?:\.\d{2})|\d+(?:\.\d{2}))", sum_text, re.IGNORECASE)
+    # Label-driven totals: take the amount that FOLLOWS each financial label
+    # (Subtotal / CGST / SGST / IGST / Total / Grand Total / Amount Payable /
+    # Payment Made / Balance Due ...). This replaces the old "largest number in
+    # the summary area" heuristic that kept grabbing bank A/C / IFSC footer
+    # digits (987654321...) as the grand total.
+    labelled = _parse_pdf_labeled_summary(sum_text)
 
-    if tot_m: summary.grand_total = clean_num(tot_m.group(1))
-    if sub_m: summary.subtotal = clean_num(sub_m.group(1))
-    if gst_m: summary.total_gst = clean_num(gst_m.group(1))
-
-    # Fallback to positional tokens if labeled pattern not found
-    if summary.grand_total == 0.0:
-        summary_num_tokens = []
-        for w in summary_words:
-            if "%" not in w["text"]:
-                v = clean_num(w["text"])
-                if v > 0:
-                    summary_num_tokens.append((v, w["x0"], w["y0"], w["text"]))
-
-        summary_num_tokens = sorted(summary_num_tokens, key=lambda item: (item[2], item[1]))
-        unique_summary_nums = []
-        for v, _, _, _ in summary_num_tokens:
-            if v not in unique_summary_nums:
-                unique_summary_nums.append(v)
-
-        if len(unique_summary_nums) >= 3:
-            sorted_vals = sorted(unique_summary_nums, reverse=True)
-            summary.grand_total = sorted_vals[0]
-            summary.subtotal = sorted_vals[1]
-            summary.total_gst = sorted_vals[2]
-        elif len(unique_summary_nums) >= 1:
-            summary.grand_total = max(unique_summary_nums)
-
-    # Cross-reconcile with line items if available
-    if line_items:
-        comp_grand = round(sum(it.total_amount for it in line_items), 2)
-        comp_sub = round(sum(it.unit_price * (it.quantity or 1.0) for it in line_items), 2)
-        if summary.grand_total == 0.0:
-            summary.grand_total = comp_grand
-        if summary.subtotal == 0.0:
-            summary.subtotal = comp_sub
-        if summary.total_gst == 0.0 and summary.grand_total > summary.subtotal:
-            summary.total_gst = round(summary.grand_total - summary.subtotal, 2)
+    # Cross-validate every figure against the totals implied by the parsed
+    # table items (grand = sum of the AMOUNT column, subtotal = qty x rate) so a
+    # printed total that is missing or doesn't reconcile can never corrupt the
+    # invoice.
+    summary = _summary_cross_validated(labelled, line_items)
 
     # 5. High-Precision Bounding Boxes
     bounding_boxes = []
@@ -624,10 +968,19 @@ def extract_invoice_local(
             seller.name = s_lines[0]
             seller.address = ", ".join(s_lines[1:])
     elif not seller.name:
-        for l in lines[:5]:
-            if not re.search(r"Invoice|Date|Tax|Page", l, re.IGNORECASE) and len(l) > 2:
-                seller.name = l
-                break
+        # fitz text order can be jumbled (summary block first), so prefer the
+        # spatially top-most block / the block above the GSTIN when available.
+        blk_seller = _detect_seller_block(pages, seller.gstin)
+        if blk_seller:
+            seller.name = blk_seller[0]
+            if blk_seller[1]:
+                seller.address = blk_seller[1]
+        else:
+            for l in lines[:5]:
+                if (not re.search(r"Invoice|Date|Tax|Page|Sub\s*Total|CGST|SGST|Balance|Payment|Total In Words|Thanks|Notes|Authorized", l, re.IGNORECASE)
+                        and len(l) > 2 and not l.isdigit()):
+                    seller.name = l
+                    break
 
     target_c = client_idx if client_idx != -1 else bill_to_idx
     if target_c != -1:
@@ -636,41 +989,50 @@ def extract_invoice_local(
             buyer.name = c_lines[0]
             buyer.address = ", ".join(c_lines[1:])
 
-    # Table items
+    # Table items (header located by scanning — pdfplumber merges the whole
+    # page into one wide table for Zoho-style layouts).
     line_items: List[LineItem] = []
     if tables:
-        for t in tables:
-            rows = t.get("data", [])
-            if not rows or len(rows) < 2: continue
-            header = [str(c or "").strip().upper() for c in rows[0]]
-            if any("DESC" in h or "ITEM" in h or "NET PRICE" in h for h in header):
-                sno_col = next((i for i, h in enumerate(header) if h in ["NO.", "NO", "#", "S.NO"]), 0)
-                desc_col = next((i for i, h in enumerate(header) if "DESC" in h or "ITEM" in h), 1)
-                qty_col = next((i for i, h in enumerate(header) if "QTY" in h), None)
-                rate_col = next((i for i, h in enumerate(header) if "PRICE" in h or "RATE" in h), None)
-                tot_col = next((i for i, h in enumerate(header) if "GROSS" in h or "AMOUNT" in h or "TOTAL" in h), None)
-
-                for r in rows[1:]:
-                    d = str(r[desc_col] or "").strip() if desc_col < len(r) else ""
-                    if not d or "TOTAL" in d.upper(): continue
-                    q = clean_num(r[qty_col]) if qty_col is not None and qty_col < len(r) else 1.0
-                    p = clean_num(r[rate_col]) if rate_col is not None and rate_col < len(r) else 0.0
-                    tot = clean_num(r[tot_col]) if tot_col is not None and tot_col < len(r) else (q * p)
-                    line_items.append(LineItem(
-                        sno=str(r[sno_col] or len(line_items)+1),
-                        description=d,
-                        quantity=q or 1.0,
-                        unit="each",
-                        unit_price=p,
-                        total_amount=tot
-                    ))
+        line_items = _pdf_parse_line_items(tables)
 
     summary = InvoiceSummary()
+    layout_text = plumber_res.get("full_text", "") or ""
+    labelled = _parse_pdf_labeled_summary(layout_text)
     if line_items:
-        summary.grand_total = round(sum(it.total_amount for it in line_items), 2)
-        summary.subtotal = round(sum(it.unit_price * (it.quantity or 1.0) for it in line_items), 2)
-        if summary.grand_total > summary.subtotal:
-            summary.total_gst = round(summary.grand_total - summary.subtotal, 2)
+        item_taxable = round(sum(it.taxable_value or 0.0 for it in line_items), 2)
+        item_tax = round(sum(it.tax_amount or 0.0 for it in line_items), 2)
+        item_gross = round(sum(it.total_amount for it in line_items), 2)
+
+        subtotal = labelled.get("subtotal")
+        total_gst = labelled.get("total_gst")
+        grand = labelled.get("grand_total")
+
+        if subtotal is None:
+            subtotal = item_taxable if item_taxable > 0 else item_gross
+        if grand is None:
+            grand = item_gross if item_gross > 0 else round(subtotal + (total_gst or 0.0), 2)
+        if total_gst is None:
+            total_gst = item_tax if item_tax > 0 else round(max(grand - subtotal, 0.0), 2)
+
+        summary.subtotal = round(subtotal, 2)
+        summary.total_gst = round(total_gst, 2)
+        summary.grand_total = round(grand, 2)
+        if labelled.get("amount_paid") is not None:
+            summary.amount_paid = round(labelled["amount_paid"], 2)
+        if labelled.get("balance_due") is not None:
+            summary.balance_due = round(labelled["balance_due"], 2)
+    else:
+        # No item rows — still surface labelled totals when present.
+        if labelled.get("subtotal") is not None:
+            summary.subtotal = round(labelled["subtotal"], 2)
+        if labelled.get("total_gst") is not None:
+            summary.total_gst = round(labelled["total_gst"], 2)
+        if labelled.get("grand_total") is not None:
+            summary.grand_total = round(labelled["grand_total"], 2)
+        if labelled.get("amount_paid") is not None:
+            summary.amount_paid = round(labelled["amount_paid"], 2)
+        if labelled.get("balance_due") is not None:
+            summary.balance_due = round(labelled["balance_due"], 2)
 
     bounding_boxes = []
     for page in pages:
