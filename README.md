@@ -1,6 +1,6 @@
 # Document OCR integration
 
-Full-stack invoice OCR: a **FastAPI backend** (ported from `invoice-ocr-c++` — EasyOCR spatial cell-grid table engine with PostgreSQL template auto-learning) served behind a **React/Vite frontend**. Local OCR runs first (their engine); when its output is weak, the pipeline falls back to **Claude** (primary) then **Gemini** (backup).
+Full-stack invoice OCR: EasyOCR spatial cell-grid table engine with PostgreSQL template auto-learning served behind a **React/Vite frontend**. Local OCR runs first (their engine); when its output is weak, the pipeline falls back to **Claude** (primary) then **Gemini** (backup).
 
 ## Stack
 
@@ -8,6 +8,13 @@ Full-stack invoice OCR: a **FastAPI backend** (ported from `invoice-ocr-c++` —
 - **Frontend**: `client/` — React + Vite, proxies `/api` → `:8000`.
 - **DB**: Postgres — their schema (`invoice_templates`, `extraction_logs`, `extraction_reviews`), auto-created on startup. SQLite `templates.db` used only if Postgres is unavailable.
 - **Compatibility layer**: `backend/adapter.py` exposes our frontend's contract (`/api/extractions`, `/api/templates`, `/api/extractions/:id/corrections`, `/api/health`) on top of their native `/api/extract-invoice` pipeline.
+
+## Repository layout
+
+- `backend/` — FastAPI app + services (`adapter.py`, `main.py`, `services/*`) — the API served on :8000 (uvicorn).
+- `client/` — React/Vite frontend (dev server :5173, proxies `/api` → `:8000`).
+- `testing/` — sample invoices / PDFs used for manual checks.
+- `requirements.txt` / `package.json` — Python and Node dependencies.
 
 ## Run locally
 
