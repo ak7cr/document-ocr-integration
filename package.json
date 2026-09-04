@@ -9,11 +9,12 @@
     "start": "venv/bin/uvicorn backend.main:app --port 8000",
     "db:init": "venv/bin/python -c \"from backend.database import init_db; init_db()\""
   },
-  "dependencies": {},
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.12",
     "@vitejs/plugin-react": "^5.0.2",
     "concurrently": "^9.2.4",
+    "dotenv": "^17.4.2",
+    "prisma": "^7.10.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "tailwindcss": "^4.1.12",

@@ -1,0 +1,114 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model extraction_logs {
+  id                    Int                @id @default(autoincrement())
+  tenant_id             String?            @db.VarChar(100)
+  template_id           Int?
+  match_strategy        String?            @db.VarChar(50)
+  layout_match_score    Float?
+  status                String?            @db.VarChar(50)
+  invoice_number        String?            @db.VarChar(100)
+  invoice_date          DateTime?          @db.Timestamp(6)
+  format_type           String?            @db.VarChar(50)
+  vendor_name           String?            @db.VarChar(255)
+  vendor_gstin          String?            @db.VarChar(50)
+  buyer_name            String?            @db.VarChar(255)
+  buyer_gstin           String?            @db.VarChar(50)
+  engine_used           String             @db.VarChar(100)
+  engine_version        String?            @db.VarChar(50)
+  processing_time_ms    Int?
+  overall_confidence    Float?
+  field_confidence      Json?              @db.Json
+  low_confidence_fields Json?              @db.Json
+  extracted_data        Json?              @db.Json
+  normalized_data       Json?              @db.Json
+  raw_ocr_text          String?
+  grand_total           Decimal?           @db.Decimal(18, 2)
+  taxable_value         Decimal?           @db.Decimal(18, 2)
+  total_tax             Decimal?           @db.Decimal(18, 2)
+  currency              String?            @db.VarChar(10)
+  validation_passed     Boolean?
+  validation_errors     Json?              @db.Json
+  is_duplicate          Boolean?
+  duplicate_of_id       Int?
+  source_file_url       String?
+  source_file_hash      String?            @db.VarChar(255)
+  original_filename     String?            @db.VarChar(255)
+  source_mime_type      String?            @db.VarChar(100)
+  source_page_count     Int?
+  file_size_bytes       Int?
+  created_at            DateTime?          @db.Timestamp(6)
+  updated_at            DateTime?          @db.Timestamp(6)
+  extraction_logs       extraction_logs?   @relation("extraction_logsToextraction_logs", fields: [duplicate_of_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  other_extraction_logs extraction_logs[]  @relation("extraction_logsToextraction_logs")
+  invoice_templates     invoice_templates? @relation(fields: [template_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+
+  @@index([buyer_gstin], map: "ix_extraction_logs_buyer_gstin")
+  @@index([created_at], map: "ix_extraction_logs_created_at")
+  @@index([duplicate_of_id], map: "ix_extraction_logs_duplicate_of_id")
+  @@index([id], map: "ix_extraction_logs_id")
+  @@index([invoice_number], map: "ix_extraction_logs_invoice_number")
+  @@index([source_file_hash], map: "ix_extraction_logs_source_file_hash")
+  @@index([status], map: "ix_extraction_logs_status")
+  @@index([template_id], map: "ix_extraction_logs_template_id")
+  @@index([tenant_id], map: "ix_extraction_logs_tenant_id")
+  @@index([vendor_gstin], map: "ix_extraction_logs_vendor_gstin")
+}
+
+model extraction_reviews {
+  id                Int       @id @default(autoincrement())
+  extraction_log_id Int
+  action            String    @db.VarChar(50)
+  corrected_fields  Json?     @db.Json
+  reviewer_note     String?
+  reviewed_by       String?   @db.VarChar(255)
+  created_at        DateTime? @db.Timestamp(6)
+
+  @@index([extraction_log_id], map: "ix_extraction_reviews_extraction_log_id")
+  @@index([id], map: "ix_extraction_reviews_id")
+}
+
+model invoice_templates {
+  id                  Int               @id @default(autoincrement())
+  template_name       String            @db.VarChar(255)
+  format_type         String?           @db.VarChar(50)
+  status              String?           @db.VarChar(50)
+  version             Int?
+  vendor_key          String?           @db.VarChar(255)
+  template_family_key String?           @db.VarChar(255)
+  supersedes_id       Int?
+  layout_hash         String?           @db.VarChar(255)
+  anchor_keywords     Json              @db.Json
+  header_geometry     Json?             @db.Json
+  column_boundaries   Json?             @db.Json
+  row_detection_rules Json?             @db.Json
+  extraction_rules    Json              @db.Json
+  table_columns       Json              @db.Json
+  known_vendors       Json?             @db.Json
+  sample_preview_url  String?
+  hit_count           Int?
+  success_count       Int?
+  failure_count       Int?
+  avg_confidence      Float?
+  last_matched_at     DateTime?         @db.Timestamp(6)
+  last_failed_at      DateTime?         @db.Timestamp(6)
+  is_verified         Boolean?
+  verified_by         String?           @db.VarChar(255)
+  verified_at         DateTime?         @db.Timestamp(6)
+  created_at          DateTime?         @db.Timestamp(6)
+  updated_at          DateTime?         @db.Timestamp(6)
+  extraction_logs     extraction_logs[]
+
+  @@index([id], map: "ix_invoice_templates_id")
+  @@index([layout_hash], map: "ix_invoice_templates_layout_hash")
+  @@index([status], map: "ix_invoice_templates_status")
+  @@index([template_family_key], map: "ix_invoice_templates_template_family_key")
+  @@index([vendor_key], map: "ix_invoice_templates_vendor_key")
+}
